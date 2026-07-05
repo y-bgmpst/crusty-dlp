@@ -1,0 +1,5 @@
+# Copy to ~/.config/crusty-dlp/config.toml
+output_dir = "/home/your-user/Downloads"
+# One of: video, audio, mp3, custom
+default_mode = "video"
+custom_format = "bestvideo+bestaudio/best"
