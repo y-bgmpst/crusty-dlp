@@ -1,12 +1,12 @@
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
-    process::Stdio,
+    process::{Command as StdCommand, Stdio},
 };
 
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
-    process::Command,
+    process::Command as TokioCommand,
     sync::{mpsc, oneshot},
 };
 
@@ -27,6 +27,12 @@ pub struct Downloader {
     output_dir: PathBuf,
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub struct DownloadOptions<'a> {
+    pub impersonation: Option<&'a str>,
+    pub cookies_browser: Option<&'a str>,
+}
+
 impl Downloader {
     pub fn new(executable: PathBuf, output_dir: PathBuf) -> Self {
         Self {
@@ -35,7 +41,12 @@ impl Downloader {
         }
     }
 
-    pub fn arguments(&self, url: &str, mode: &DownloadMode) -> Vec<OsString> {
+    pub fn arguments(
+        &self,
+        url: &str,
+        mode: &DownloadMode,
+        options: DownloadOptions<'_>,
+    ) -> Vec<OsString> {
         let mut args = vec![
             OsString::from("--newline"),
             OsString::from("--no-playlist"),
@@ -62,6 +73,14 @@ impl Downloader {
             ]),
             DownloadMode::Custom(format) => args.extend(["--format".into(), format.into()]),
         }
+        if let Some(target) = options.impersonation {
+            args.push(OsString::from("--impersonate"));
+            args.push(OsString::from(if target == "any" { "" } else { target }));
+        }
+        if let Some(browser) = options.cookies_browser {
+            args.push(OsString::from("--cookies-from-browser"));
+            args.push(OsString::from(browser));
+        }
         args.push(OsString::from("--"));
         args.push(OsString::from(url));
         args
@@ -81,7 +100,7 @@ impl Downloader {
         mut cancel: oneshot::Receiver<()>,
         tx: mpsc::UnboundedSender<DownloadEvent>,
     ) {
-        let mut child = match Command::new(&self.executable)
+        let mut child = match TokioCommand::new(&self.executable)
             .args(&args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -140,6 +159,42 @@ impl Downloader {
     }
 }
 
+/// Ask yt-dlp itself which impersonation targets are usable. This avoids
+/// assuming that an installed Python package is visible to every yt-dlp build.
+pub fn available_impersonation_targets(executable: &Path) -> Vec<String> {
+    let Ok(output) = StdCommand::new(executable)
+        .arg("--list-impersonate-targets")
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    parse_impersonation_targets(&String::from_utf8_lossy(&output.stdout))
+}
+
+fn parse_impersonation_targets(stdout: &str) -> Vec<String> {
+    let mut targets = Vec::new();
+    for line in stdout.lines() {
+        if line.contains("unavailable") {
+            continue;
+        }
+        let Some(client) = line.split_whitespace().next() else {
+            continue;
+        };
+        if matches!(client, "Client" | "---" | "[info]") {
+            continue;
+        }
+        let client = client.to_ascii_lowercase();
+        if !targets.contains(&client) {
+            targets.push(client);
+        }
+    }
+    targets
+}
+
 fn parse_progress(line: &str) -> Option<DownloadEvent> {
     let content = line.strip_prefix(PROGRESS_PREFIX)?;
     let percent = content
@@ -153,10 +208,25 @@ fn parse_progress(line: &str) -> Option<DownloadEvent> {
 }
 
 pub fn dependency_path(name: &str) -> Option<PathBuf> {
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            #[cfg(windows)]
+            let candidate = directory.join(format!("{name}.exe"));
+            #[cfg(not(windows))]
+            let candidate = directory.join(name);
+            if is_executable(&candidate) {
+                return Some(candidate);
+            }
+        }
+    }
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
+    std::env::split_paths(&paths).find_map(|dir| {
+        #[cfg(windows)]
+        let candidate = dir.join(format!("{name}.exe"));
+        #[cfg(not(windows))]
+        let candidate = dir.join(name);
+        is_executable(&candidate).then_some(candidate)
+    })
 }
 
 #[cfg(unix)]
@@ -179,7 +249,11 @@ mod tests {
     #[test]
     fn mp3_arguments_are_separate_and_url_is_last() {
         let downloader = Downloader::new("yt-dlp".into(), "/tmp/out".into());
-        let args = downloader.arguments("https://example.com/watch?v=x", &DownloadMode::Mp3);
+        let args = downloader.arguments(
+            "https://example.com/watch?v=x",
+            &DownloadMode::Mp3,
+            DownloadOptions::default(),
+        );
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--audio-format" && pair[1] == "mp3"));
@@ -193,8 +267,50 @@ mod tests {
         let args = downloader.arguments(
             "https://example.com/x",
             &DownloadMode::Custom("18; rm -rf /".into()),
+            DownloadOptions::default(),
         );
         assert!(args.contains(&OsString::from("18; rm -rf /")));
+    }
+
+    #[test]
+    fn impersonation_is_passed_as_separate_arguments() {
+        let downloader = Downloader::new("yt-dlp".into(), ".".into());
+        let args = downloader.arguments(
+            "https://example.com/x",
+            &DownloadMode::Video,
+            DownloadOptions {
+                impersonation: Some("chrome"),
+                ..DownloadOptions::default()
+            },
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--impersonate" && pair[1] == "chrome"));
+    }
+
+    #[test]
+    fn parses_only_available_impersonation_targets() {
+        let output = "[info] Available impersonate targets\nClient OS Source\n---\nChrome - curl_cffi\nChrome windows curl_cffi\nFirefox - curl_cffi>=0.10\nSafari - curl_cffi (unavailable)\n";
+        assert_eq!(
+            parse_impersonation_targets(output),
+            vec!["chrome", "firefox"]
+        );
+    }
+
+    #[test]
+    fn browser_cookie_source_is_passed_as_one_argument() {
+        let downloader = Downloader::new("yt-dlp".into(), ".".into());
+        let args = downloader.arguments(
+            "https://example.com/x",
+            &DownloadMode::Video,
+            DownloadOptions {
+                cookies_browser: Some("firefox"),
+                ..DownloadOptions::default()
+            },
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--cookies-from-browser" && pair[1] == "firefox"));
     }
 
     #[test]

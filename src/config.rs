@@ -15,6 +15,8 @@ pub struct Config {
     pub output_dir: PathBuf,
     pub default_mode: String,
     pub custom_format: String,
+    pub impersonation: String,
+    pub cookies_browser: String,
 }
 
 impl Default for Config {
@@ -26,6 +28,8 @@ impl Default for Config {
             output_dir,
             default_mode: "video".into(),
             custom_format: "bestvideo+bestaudio/best".into(),
+            impersonation: "none".into(),
+            cookies_browser: "none".into(),
         }
     }
 }

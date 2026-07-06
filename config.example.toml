@@ -3,3 +3,7 @@ output_dir = "/home/your-user/Downloads"
 # One of: video, audio, mp3, custom
 default_mode = "video"
 custom_format = "bestvideo+bestaudio/best"
+# none, any, or an installed target such as chrome, firefox, safari, edge, tor
+impersonation = "none"
+# none, firefox, chrome, chromium, brave, vivaldi, edge
+cookies_browser = "none"

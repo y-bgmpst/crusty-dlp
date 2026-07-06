@@ -2,7 +2,11 @@ use std::{collections::VecDeque, path::PathBuf};
 
 use tokio::sync::oneshot;
 
-use crate::{config::Config, downloader::DownloadEvent, errors::AppError};
+use crate::{
+    config::Config,
+    downloader::{DownloadEvent, DownloadOptions},
+    errors::AppError,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DownloadMode {
@@ -58,6 +62,7 @@ pub struct QueueItem {
 pub enum Panel {
     Url,
     Mode,
+    Impersonation,
     Output,
     Queue,
 }
@@ -78,12 +83,20 @@ pub struct App {
     pub message: String,
     pub progress: Option<f64>,
     pub progress_text: String,
+    pub impersonation_targets: Vec<String>,
+    pub show_install_prompt: bool,
     start_requested: bool,
     cancel_tx: Option<oneshot::Sender<()>>,
 }
 
 impl App {
-    pub fn new(config: Config, config_path: PathBuf, dry_run: bool, debug: bool) -> Self {
+    pub fn new(
+        config: Config,
+        config_path: PathBuf,
+        dry_run: bool,
+        debug: bool,
+        impersonation_targets: Vec<String>,
+    ) -> Self {
         let mode = match config.default_mode.as_str() {
             "audio" => DownloadMode::Audio,
             "mp3" => DownloadMode::Mp3,
@@ -106,6 +119,8 @@ impl App {
             message: "Ready".into(),
             progress: None,
             progress_text: String::new(),
+            impersonation_targets,
+            show_install_prompt: false,
             start_requested: false,
             cancel_tx: None,
         }
@@ -140,7 +155,8 @@ impl App {
     pub fn cycle_panel(&mut self) {
         self.panel = match self.panel {
             Panel::Url => Panel::Mode,
-            Panel::Mode => Panel::Output,
+            Panel::Mode => Panel::Impersonation,
+            Panel::Impersonation => Panel::Output,
             Panel::Output => Panel::Queue,
             Panel::Queue => Panel::Url,
         };
@@ -176,6 +192,7 @@ impl App {
                 self.editing = true;
             }
             Panel::Mode => self.cycle_mode(),
+            Panel::Impersonation => self.cycle_impersonation(),
             Panel::Queue => {}
         }
     }
@@ -204,7 +221,75 @@ impl App {
                 self.input.clear();
                 self.save_config();
             }
+            Panel::Impersonation => {}
             Panel::Queue => {}
+        }
+    }
+
+    pub fn cycle_impersonation(&mut self) {
+        if self.impersonation_targets.is_empty() {
+            self.show_install_prompt = true;
+            return;
+        }
+
+        let mut choices = Vec::with_capacity(self.impersonation_targets.len() + 2);
+        choices.push("none");
+        choices.push("any");
+        choices.extend(self.impersonation_targets.iter().map(String::as_str));
+        let current = choices
+            .iter()
+            .position(|choice| *choice == self.config.impersonation)
+            .unwrap_or(0);
+        self.config.impersonation = choices[(current + 1) % choices.len()].to_owned();
+        self.save_config();
+    }
+
+    pub fn impersonation_label(&self) -> &str {
+        match self.config.impersonation.as_str() {
+            "none" => "None",
+            "any" => "Any available",
+            target => target,
+        }
+    }
+
+    pub fn requires_impersonation(&self, url: &str) -> bool {
+        is_boyfriendtv_url(url)
+    }
+
+    pub fn effective_impersonation<'a>(&'a self, url: &str) -> Option<&'a str> {
+        match self.config.impersonation.as_str() {
+            "none" if self.requires_impersonation(url) => Some("any"),
+            "none" => None,
+            target => Some(target),
+        }
+    }
+
+    pub fn download_options<'a>(&'a self, url: &str) -> DownloadOptions<'a> {
+        DownloadOptions {
+            impersonation: self.effective_impersonation(url),
+            cookies_browser: match self.config.cookies_browser.as_str() {
+                "none" => None,
+                browser => Some(browser),
+            },
+        }
+    }
+
+    pub fn cycle_cookies_browser(&mut self) {
+        const BROWSERS: &[&str] = &[
+            "none", "firefox", "chrome", "chromium", "brave", "vivaldi", "edge",
+        ];
+        let current = BROWSERS
+            .iter()
+            .position(|browser| *browser == self.config.cookies_browser)
+            .unwrap_or(0);
+        self.config.cookies_browser = BROWSERS[(current + 1) % BROWSERS.len()].to_owned();
+        self.save_config();
+    }
+
+    pub fn cookies_browser_label(&self) -> &str {
+        match self.config.cookies_browser.as_str() {
+            "none" => "off",
+            browser => browser,
         }
     }
 
@@ -321,6 +406,22 @@ pub fn validate_url(value: &str) -> Result<(), AppError> {
     }
 }
 
+pub fn is_boyfriendtv_url(value: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "boyfriendtv.com" || host.ends_with(".boyfriendtv.com")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,7 +441,13 @@ mod tests {
 
     #[test]
     fn next_queued_skips_completed_items() {
-        let mut app = App::new(Config::default(), "config.toml".into(), false, false);
+        let mut app = App::new(
+            Config::default(),
+            "config.toml".into(),
+            false,
+            false,
+            Vec::new(),
+        );
         app.queue.push_back(QueueItem {
             url: "https://example.com/old".into(),
             state: DownloadState::Finished,
@@ -351,5 +458,18 @@ mod tests {
         });
         assert_eq!(app.next_queued().unwrap().url, "https://example.com/new");
         assert_eq!(app.queue.front().unwrap().state, DownloadState::Finished);
+    }
+
+    #[test]
+    fn identifies_only_boyfriendtv_hosts() {
+        assert!(is_boyfriendtv_url(
+            "https://www.boyfriendtv.com/videos/123/example"
+        ));
+        assert!(!is_boyfriendtv_url(
+            "https://boyfriendtv.com.example.org/videos/123"
+        ));
+        assert!(!is_boyfriendtv_url(
+            "https://example.org/?next=boyfriendtv.com"
+        ));
     }
 }

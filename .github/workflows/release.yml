@@ -1,0 +1,58 @@
+name: Windows release
+
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build crusty-dlp
+        run: cargo build --release --locked
+
+      - name: Bundle verified yt-dlp
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/bundle | Out-Null
+          Copy-Item target/release/crusty-dlp.exe dist/crusty-dlp.exe
+          Copy-Item target/release/crusty-dlp.exe dist/bundle/crusty-dlp.exe
+          Copy-Item README.md, COMPATIBILITY.md, LICENSE dist/bundle/
+
+          $base = "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
+          Invoke-WebRequest "$base/yt-dlp.exe" -OutFile dist/bundle/yt-dlp.exe
+          Invoke-WebRequest "$base/SHA2-256SUMS" -OutFile dist/SHA2-256SUMS
+          $expected = ((Select-String -Path dist/SHA2-256SUMS -Pattern " yt-dlp.exe$").Line -split "\s+")[0]
+          $actual = (Get-FileHash dist/bundle/yt-dlp.exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne $expected.ToLowerInvariant()) {
+            throw "yt-dlp.exe checksum mismatch"
+          }
+
+          Compress-Archive -Path dist/bundle/* -DestinationPath dist/crusty-dlp-windows-x86_64.zip
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: crusty-dlp-windows-x86_64
+          path: |
+            dist/crusty-dlp.exe
+            dist/crusty-dlp-windows-x86_64.zip
+
+      - name: Publish GitHub release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            --repo $env:GITHUB_REPOSITORY `
+            --generate-notes `
+            --title "crusty-dlp $env:GITHUB_REF_NAME" `
+            dist/crusty-dlp.exe `
+            dist/crusty-dlp-windows-x86_64.zip

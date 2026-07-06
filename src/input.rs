@@ -6,6 +6,17 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     if key.kind != KeyEventKind::Press {
         return;
     }
+    if app.show_install_prompt {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                app.message = "Install with: sudo pacman -S python-curl_cffi".into();
+                app.show_install_prompt = false;
+            }
+            KeyCode::Char('n') | KeyCode::Esc => app.show_install_prompt = false,
+            _ => {}
+        }
+        return;
+    }
     if app.show_help {
         app.show_help = false;
         return;
@@ -35,6 +46,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('d') => app.request_start(),
         KeyCode::Char('c') => app.cancel(),
+        KeyCode::Char('b') => app.cycle_cookies_browser(),
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Tab => app.cycle_panel(),
         KeyCode::Enter | KeyCode::Char(' ') => app.edit_current_panel(),

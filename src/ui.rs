@@ -42,6 +42,9 @@ pub fn render(frame: &mut Frame, app: &App) {
     if app.show_help {
         render_help(frame, area);
     }
+    if app.show_install_prompt {
+        render_install_prompt(frame, area);
+    }
 }
 
 fn render_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -66,9 +69,10 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
     let columns = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(40),
-            Constraint::Percentage(25),
-            Constraint::Percentage(35),
+            Constraint::Percentage(32),
+            Constraint::Percentage(20),
+            Constraint::Percentage(20),
+            Constraint::Percentage(28),
         ])
         .split(area);
     let input_text = if app.editing && app.panel == Panel::Url {
@@ -96,6 +100,20 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
             .block(panel_block(" Download type ", app.panel == Panel::Mode)),
         columns[1],
     );
+    let impersonation_detail = if app.impersonation_targets.is_empty() {
+        "Unavailable\nEnter to install"
+    } else {
+        app.impersonation_label()
+    };
+    frame.render_widget(
+        Paragraph::new(impersonation_detail)
+            .wrap(Wrap { trim: true })
+            .block(panel_block(
+                " Impersonation ",
+                app.panel == Panel::Impersonation,
+            )),
+        columns[2],
+    );
     let output = if app.editing && app.panel == Panel::Output {
         app.input.as_str().into()
     } else {
@@ -105,7 +123,7 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(output)
             .wrap(Wrap { trim: false })
             .block(panel_block(" Output folder ", app.panel == Panel::Output)),
-        columns[2],
+        columns[3],
     );
 }
 
@@ -179,8 +197,10 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
     let text = format!(
-        "{}{}   │   q quit  a add  d download  c cancel  Tab panels  ? help",
-        app.message, debug
+        "{}{}   │ cookies:{} │ q quit a add d download c cancel b browser Tab panels ? help",
+        app.message,
+        debug,
+        app.cookies_browser_label()
     );
     frame.render_widget(
         Paragraph::new(text)
@@ -193,10 +213,22 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(58, 16, area);
     frame.render_widget(Clear, popup);
-    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  d       Start/continue queue\n  c       Cancel active download\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nPress any key to close";
+    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  d       Start/continue queue\n  c       Cancel active download\n  b       Cycle browser cookie source\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nPress any key to close";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::bordered().title(" Help "))
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
+fn render_install_prompt(frame: &mut Frame, area: Rect) {
+    let popup = centered_rect(64, 9, area);
+    frame.render_widget(Clear, popup);
+    let text = "No yt-dlp impersonation targets are available.\n\nInstall Arch/CachyOS support?\n  sudo pacman -S python-curl_cffi\n\nPress y/Enter to show the command, or n/Esc to cancel.";
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::bordered().title(" Install impersonation support? "))
             .wrap(Wrap { trim: false }),
         popup,
     );

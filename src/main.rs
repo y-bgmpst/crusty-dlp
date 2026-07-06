@@ -16,7 +16,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use downloader::{dependency_path, DownloadEvent, Downloader};
+use downloader::{available_impersonation_targets, dependency_path, DownloadEvent, Downloader};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
@@ -48,7 +48,18 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = Config::path()?;
     let config = Config::load(&config_path)?;
-    let mut app = App::new(config, config_path, cli.dry_run, cli.debug);
+    let yt_dlp = dependency_path("yt-dlp");
+    let impersonation_targets = yt_dlp
+        .as_deref()
+        .map(available_impersonation_targets)
+        .unwrap_or_default();
+    let mut app = App::new(
+        config,
+        config_path,
+        cli.dry_run,
+        cli.debug,
+        impersonation_targets,
+    );
     for url in cli.urls {
         app.add_url(url);
     }
@@ -58,7 +69,7 @@ async fn main() -> Result<()> {
     if cli.dry_run && !app.queue.is_empty() {
         let downloader = Downloader::new("yt-dlp".into(), app.config.output_dir.clone());
         for item in &app.queue {
-            let args = downloader.arguments(&item.url, &app.mode);
+            let args = downloader.arguments(&item.url, &app.mode, app.download_options(&item.url));
             println!("{}", downloader.display_command(&args));
         }
         return Ok(());
@@ -117,7 +128,14 @@ async fn start_next(app: &mut App, tx: mpsc::UnboundedSender<DownloadEvent>) {
     }
 
     let downloader = Downloader::new(yt_dlp, app.config.output_dir.clone());
-    let args = downloader.arguments(&item.url, &app.mode);
+    if app.requires_impersonation(&item.url) && app.impersonation_targets.is_empty() {
+        app.fail_item(
+            item,
+            "BoyfriendTV requires impersonation; install: sudo pacman -S python-curl_cffi",
+        );
+        return;
+    }
+    let args = downloader.arguments(&item.url, &app.mode, app.download_options(&item.url));
     if app.dry_run {
         app.finish_dry_run(item, downloader.display_command(&args));
         return;
