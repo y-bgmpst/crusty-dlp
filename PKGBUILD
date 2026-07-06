@@ -1,6 +1,6 @@
 # Maintainer: crusty-dlp contributors
 pkgname=crusty-dlp
-pkgver=0.3.2
+pkgver=0.3.3
 pkgrel=1
 pkgdesc='Small terminal UI for safe yt-dlp download queues'
 arch=('x86_64' 'aarch64')
@@ -34,4 +34,6 @@ package() {
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 plugins/yt_dlp_plugins/extractor/boyfriendtv.py \
     "$pkgdir/usr/share/$pkgname/plugins/yt_dlp_plugins/extractor/boyfriendtv.py"
+  install -Dm644 plugins/yt_dlp_plugins/extractor/pmvhaven.py \
+    "$pkgdir/usr/share/$pkgname/plugins/yt_dlp_plugins/extractor/pmvhaven.py"
 }

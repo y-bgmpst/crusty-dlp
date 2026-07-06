@@ -146,11 +146,18 @@ impl App {
     pub fn add_url(&mut self, url: String) {
         match validate_url(&url) {
             Ok(()) => {
+                let needs_spankbang_session =
+                    is_spankbang_url(&url) && self.config.cookies_browser == "none";
                 self.queue.push_back(QueueItem {
                     url,
                     state: DownloadState::Waiting,
                 });
-                self.message = "Added to queue".into();
+                self.message = if needs_spankbang_session {
+                    "SpankBang may require fresh browser cookies; press b to select that browser"
+                        .into()
+                } else {
+                    "Added to queue".into()
+                };
             }
             Err(error) => self.message = error.to_string(),
         }
@@ -260,11 +267,17 @@ impl App {
     }
 
     pub fn requires_impersonation(&self, url: &str) -> bool {
-        is_boyfriendtv_url(url)
+        is_boyfriendtv_url(url) || is_spankbang_url(url)
     }
 
     pub fn effective_impersonation<'a>(&'a self, url: &str) -> Option<&'a str> {
         match self.config.impersonation.as_str() {
+            "none" if is_spankbang_url(url) => match self.config.cookies_browser.as_str() {
+                "firefox" => Some("firefox"),
+                "edge" => Some("edge"),
+                "chrome" | "chromium" | "brave" | "vivaldi" => Some("chrome"),
+                _ => Some("any"),
+            },
             "none" if self.requires_impersonation(url) => Some("any"),
             "none" => None,
             target => Some(target),
@@ -435,6 +448,14 @@ pub fn validate_url(value: &str) -> Result<(), AppError> {
 }
 
 pub fn is_boyfriendtv_url(value: &str) -> bool {
+    url_host_matches(value, "boyfriendtv.com")
+}
+
+pub fn is_spankbang_url(value: &str) -> bool {
+    url_host_matches(value, "spankbang.com")
+}
+
+fn url_host_matches(value: &str, expected: &str) -> bool {
     let Some((_, remainder)) = value.split_once("://") else {
         return false;
     };
@@ -447,7 +468,7 @@ pub fn is_boyfriendtv_url(value: &str) -> bool {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    host == "boyfriendtv.com" || host.ends_with(".boyfriendtv.com")
+    host == expected || host.ends_with(&format!(".{expected}"))
 }
 
 #[cfg(test)]
@@ -500,5 +521,33 @@ mod tests {
         assert!(!is_boyfriendtv_url(
             "https://example.org/?next=boyfriendtv.com"
         ));
+    }
+
+    #[test]
+    fn identifies_only_spankbang_hosts() {
+        assert!(is_spankbang_url(
+            "https://spankbang.com/7ubnq/video/example"
+        ));
+        assert!(!is_spankbang_url("https://spankbang.com.example.org/x"));
+    }
+
+    #[test]
+    fn spankbang_uses_matching_cookie_browser_impersonation() {
+        let config = Config {
+            cookies_browser: "firefox".into(),
+            ..Config::default()
+        };
+        let app = App::new(
+            config,
+            "config.toml".into(),
+            false,
+            false,
+            vec!["firefox".into()],
+            false,
+        );
+        assert_eq!(
+            app.effective_impersonation("https://spankbang.com/7ubnq/video/example"),
+            Some("firefox")
+        );
     }
 }

@@ -194,11 +194,15 @@ impl Downloader {
 fn plugin_directory() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let directory = executable.parent()?;
-    let mut candidates: Vec<_> = directory.ancestors().take(5).map(Path::to_owned).collect();
     #[cfg(unix)]
-    candidates.push(PathBuf::from("/usr/share/crusty-dlp"));
-    candidates
-        .into_iter()
+    let system_directory = Some(PathBuf::from("/usr/share/crusty-dlp"));
+    #[cfg(not(unix))]
+    let system_directory: Option<PathBuf> = None;
+    directory
+        .ancestors()
+        .take(5)
+        .map(Path::to_owned)
+        .chain(system_directory)
         .find(|path| path.join("plugins/yt_dlp_plugins/extractor").is_dir())
 }
 

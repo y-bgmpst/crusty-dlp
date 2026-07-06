@@ -152,6 +152,18 @@ This requires `python-curl_cffi`; the application shows an actionable error if
 it is unavailable. Support is independently implemented and does not copy code
 from the unlicensed third-party userscript.
 
+### PMVHaven and SpankBang
+
+PMVHaven video URLs use the bundled extractor plugin to read the page's public
+VideoObject metadata and HLS manifest.
+
+SpankBang uses Cloudflare checks that can require a recent browser session. Open
+the video in your browser first, press `b` in crusty-dlp until the same browser
+is selected, and retry within roughly 30 minutes. The application passes cookies
+directly from that browser and aligns impersonation to its browser family; it
+does not store the cookies or bypass CAPTCHA/access controls. Close the browser
+if its cookie database is locked.
+
 ## Configuration
 
 Configuration follows the Linux XDG base directory convention and normally
