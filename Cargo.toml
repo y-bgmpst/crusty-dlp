@@ -1,6 +1,6 @@
 [package]
 name = "crusty-dlp"
-version = "0.3.3"
+version = "0.3.0"
 edition = "2021"
 license = "MIT"
 description = "A small, safe terminal UI for yt-dlp"

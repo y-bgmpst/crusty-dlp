@@ -63,7 +63,6 @@ pub enum Panel {
     Url,
     Mode,
     Impersonation,
-    Connections,
     Output,
     Queue,
 }
@@ -86,7 +85,6 @@ pub struct App {
     pub progress_text: String,
     pub impersonation_targets: Vec<String>,
     pub show_install_prompt: bool,
-    pub aria2_available: bool,
     start_requested: bool,
     cancel_tx: Option<oneshot::Sender<()>>,
 }
@@ -98,7 +96,6 @@ impl App {
         dry_run: bool,
         debug: bool,
         impersonation_targets: Vec<String>,
-        aria2_available: bool,
     ) -> Self {
         let mode = match config.default_mode.as_str() {
             "audio" => DownloadMode::Audio,
@@ -124,7 +121,6 @@ impl App {
             progress_text: String::new(),
             impersonation_targets,
             show_install_prompt: false,
-            aria2_available,
             start_requested: false,
             cancel_tx: None,
         }
@@ -146,18 +142,11 @@ impl App {
     pub fn add_url(&mut self, url: String) {
         match validate_url(&url) {
             Ok(()) => {
-                let needs_spankbang_session =
-                    is_spankbang_url(&url) && self.config.cookies_browser == "none";
                 self.queue.push_back(QueueItem {
                     url,
                     state: DownloadState::Waiting,
                 });
-                self.message = if needs_spankbang_session {
-                    "SpankBang may require fresh browser cookies; press b to select that browser"
-                        .into()
-                } else {
-                    "Added to queue".into()
-                };
+                self.message = "Added to queue".into();
             }
             Err(error) => self.message = error.to_string(),
         }
@@ -167,8 +156,7 @@ impl App {
         self.panel = match self.panel {
             Panel::Url => Panel::Mode,
             Panel::Mode => Panel::Impersonation,
-            Panel::Impersonation => Panel::Connections,
-            Panel::Connections => Panel::Output,
+            Panel::Impersonation => Panel::Output,
             Panel::Output => Panel::Queue,
             Panel::Queue => Panel::Url,
         };
@@ -205,7 +193,6 @@ impl App {
             }
             Panel::Mode => self.cycle_mode(),
             Panel::Impersonation => self.cycle_impersonation(),
-            Panel::Connections => self.cycle_connections(),
             Panel::Queue => {}
         }
     }
@@ -235,7 +222,6 @@ impl App {
                 self.save_config();
             }
             Panel::Impersonation => {}
-            Panel::Connections => {}
             Panel::Queue => {}
         }
     }
@@ -267,17 +253,11 @@ impl App {
     }
 
     pub fn requires_impersonation(&self, url: &str) -> bool {
-        is_boyfriendtv_url(url) || is_spankbang_url(url)
+        is_boyfriendtv_url(url)
     }
 
     pub fn effective_impersonation<'a>(&'a self, url: &str) -> Option<&'a str> {
         match self.config.impersonation.as_str() {
-            "none" if is_spankbang_url(url) => match self.config.cookies_browser.as_str() {
-                "firefox" => Some("firefox"),
-                "edge" => Some("edge"),
-                "chrome" | "chromium" | "brave" | "vivaldi" => Some("chrome"),
-                _ => Some("any"),
-            },
             "none" if self.requires_impersonation(url) => Some("any"),
             "none" => None,
             target => Some(target),
@@ -291,28 +271,7 @@ impl App {
                 "none" => None,
                 browser => Some(browser),
             },
-            concurrent_fragments: self.config.concurrent_fragments,
-            use_aria2: self.config.use_aria2 && self.aria2_available,
         }
-    }
-
-    pub fn cycle_connections(&mut self) {
-        const CONNECTIONS: &[u8] = &[1, 2, 4, 8, 12, 16];
-        let current = CONNECTIONS
-            .iter()
-            .position(|value| *value == self.config.concurrent_fragments)
-            .unwrap_or(2);
-        self.config.concurrent_fragments = CONNECTIONS[(current + 1) % CONNECTIONS.len()];
-        self.save_config();
-    }
-
-    pub fn toggle_aria2(&mut self) {
-        if !self.aria2_available {
-            self.message = "aria2c not found; install: sudo pacman -S aria2".into();
-            return;
-        }
-        self.config.use_aria2 = !self.config.use_aria2;
-        self.save_config();
     }
 
     pub fn cycle_cookies_browser(&mut self) {
@@ -448,14 +407,6 @@ pub fn validate_url(value: &str) -> Result<(), AppError> {
 }
 
 pub fn is_boyfriendtv_url(value: &str) -> bool {
-    url_host_matches(value, "boyfriendtv.com")
-}
-
-pub fn is_spankbang_url(value: &str) -> bool {
-    url_host_matches(value, "spankbang.com")
-}
-
-fn url_host_matches(value: &str, expected: &str) -> bool {
     let Some((_, remainder)) = value.split_once("://") else {
         return false;
     };
@@ -468,7 +419,7 @@ fn url_host_matches(value: &str, expected: &str) -> bool {
         .next()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    host == expected || host.ends_with(&format!(".{expected}"))
+    host == "boyfriendtv.com" || host.ends_with(".boyfriendtv.com")
 }
 
 #[cfg(test)]
@@ -496,7 +447,6 @@ mod tests {
             false,
             false,
             Vec::new(),
-            false,
         );
         app.queue.push_back(QueueItem {
             url: "https://example.com/old".into(),
@@ -521,33 +471,5 @@ mod tests {
         assert!(!is_boyfriendtv_url(
             "https://example.org/?next=boyfriendtv.com"
         ));
-    }
-
-    #[test]
-    fn identifies_only_spankbang_hosts() {
-        assert!(is_spankbang_url(
-            "https://spankbang.com/7ubnq/video/example"
-        ));
-        assert!(!is_spankbang_url("https://spankbang.com.example.org/x"));
-    }
-
-    #[test]
-    fn spankbang_uses_matching_cookie_browser_impersonation() {
-        let config = Config {
-            cookies_browser: "firefox".into(),
-            ..Config::default()
-        };
-        let app = App::new(
-            config,
-            "config.toml".into(),
-            false,
-            false,
-            vec!["firefox".into()],
-            false,
-        );
-        assert_eq!(
-            app.effective_impersonation("https://spankbang.com/7ubnq/video/example"),
-            Some("firefox")
-        );
     }
 }

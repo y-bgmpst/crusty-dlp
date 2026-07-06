@@ -1,6 +1,6 @@
 # Maintainer: crusty-dlp contributors
 pkgname=crusty-dlp
-pkgver=0.3.3
+pkgver=0.3.0
 pkgrel=1
 pkgdesc='Small terminal UI for safe yt-dlp download queues'
 arch=('x86_64' 'aarch64')
@@ -11,7 +11,6 @@ optdepends=(
   'ffmpeg: audio extraction, conversion, and format merging'
   'python-curl_cffi: browser request impersonation and BoyfriendTV support'
   'deno: JavaScript challenge solving for full YouTube support'
-  'aria2: multi-connection downloads for direct HTTP files'
 )
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")
@@ -32,8 +31,4 @@ package() {
   install -Dm755 "target/release/$pkgname" "$pkgdir/usr/bin/$pkgname"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
-  install -Dm644 plugins/yt_dlp_plugins/extractor/boyfriendtv.py \
-    "$pkgdir/usr/share/$pkgname/plugins/yt_dlp_plugins/extractor/boyfriendtv.py"
-  install -Dm644 plugins/yt_dlp_plugins/extractor/pmvhaven.py \
-    "$pkgdir/usr/share/$pkgname/plugins/yt_dlp_plugins/extractor/pmvhaven.py"
 }

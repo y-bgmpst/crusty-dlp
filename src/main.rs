@@ -59,7 +59,6 @@ async fn main() -> Result<()> {
         cli.dry_run,
         cli.debug,
         impersonation_targets,
-        dependency_path("aria2c").is_some(),
     );
     for url in cli.urls {
         app.add_url(url);

@@ -24,7 +24,6 @@ jobs:
           Copy-Item target/release/crusty-dlp.exe dist/crusty-dlp.exe
           Copy-Item target/release/crusty-dlp.exe dist/bundle/crusty-dlp.exe
           Copy-Item README.md, COMPATIBILITY.md, LICENSE dist/bundle/
-          Copy-Item plugins dist/bundle/plugins -Recurse
 
           $base = "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
           Invoke-WebRequest "$base/yt-dlp.exe" -OutFile dist/bundle/yt-dlp.exe

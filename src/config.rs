@@ -17,8 +17,6 @@ pub struct Config {
     pub custom_format: String,
     pub impersonation: String,
     pub cookies_browser: String,
-    pub concurrent_fragments: u8,
-    pub use_aria2: bool,
 }
 
 impl Default for Config {
@@ -32,8 +30,6 @@ impl Default for Config {
             custom_format: "bestvideo+bestaudio/best".into(),
             impersonation: "none".into(),
             cookies_browser: "none".into(),
-            concurrent_fragments: 4,
-            use_aria2: false,
         }
     }
 }
