@@ -184,7 +184,7 @@ dependencies = [
 
 [[package]]
 name = "crusty-dlp"
-version = "0.3.0"
+version = "0.3.3"
 dependencies = [
  "anyhow",
  "clap",

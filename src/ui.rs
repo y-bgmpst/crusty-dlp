@@ -30,7 +30,7 @@ pub fn render(frame: &mut Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Length(7),
+            Constraint::Length(10),
             Constraint::Min(7),
             Constraint::Length(3),
         ])
@@ -66,15 +66,22 @@ fn render_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
-    let columns = Layout::default()
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let top = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(rows[0]);
+    let bottom = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Percentage(32),
-            Constraint::Percentage(20),
-            Constraint::Percentage(20),
-            Constraint::Percentage(28),
+            Constraint::Percentage(34),
+            Constraint::Percentage(33),
+            Constraint::Percentage(33),
         ])
-        .split(area);
+        .split(rows[1]);
     let input_text = if app.editing && app.panel == Panel::Url {
         app.input.as_str()
     } else {
@@ -84,7 +91,18 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(input_text)
             .wrap(Wrap { trim: false })
             .block(panel_block(" URL input ", app.panel == Panel::Url)),
-        columns[0],
+        top[0],
+    );
+    let output = if app.editing && app.panel == Panel::Output {
+        app.input.as_str().into()
+    } else {
+        app.config.output_dir.to_string_lossy()
+    };
+    frame.render_widget(
+        Paragraph::new(output)
+            .wrap(Wrap { trim: false })
+            .block(panel_block(" Output folder ", app.panel == Panel::Output)),
+        top[1],
     );
     let mode_detail = if app.editing && app.panel == Panel::Mode {
         format!("Custom format\n{}", app.input)
@@ -98,7 +116,7 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(mode_detail)
             .wrap(Wrap { trim: true })
             .block(panel_block(" Download type ", app.panel == Panel::Mode)),
-        columns[1],
+        bottom[0],
     );
     let impersonation_detail = if app.impersonation_targets.is_empty() {
         "Unavailable\nEnter to install"
@@ -112,18 +130,25 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
                 " Impersonation ",
                 app.panel == Panel::Impersonation,
             )),
-        columns[2],
+        bottom[1],
     );
-    let output = if app.editing && app.panel == Panel::Output {
-        app.input.as_str().into()
+    let aria2 = if app.config.use_aria2 && app.aria2_available {
+        "on"
     } else {
-        app.config.output_dir.to_string_lossy()
+        "off"
     };
+    let connections = format!(
+        "{} connections\naria2: {} (r toggles)",
+        app.config.concurrent_fragments, aria2
+    );
     frame.render_widget(
-        Paragraph::new(output)
-            .wrap(Wrap { trim: false })
-            .block(panel_block(" Output folder ", app.panel == Panel::Output)),
-        columns[3],
+        Paragraph::new(connections)
+            .wrap(Wrap { trim: true })
+            .block(panel_block(
+                " Connections ",
+                app.panel == Panel::Connections,
+            )),
+        bottom[2],
     );
 }
 
@@ -211,9 +236,9 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn render_help(frame: &mut Frame, area: Rect) {
-    let popup = centered_rect(58, 16, area);
+    let popup = centered_rect(68, 20, area);
     frame.render_widget(Clear, popup);
-    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  d       Start/continue queue\n  c       Cancel active download\n  b       Cycle browser cookie source\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nPress any key to close";
+    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  d       Start/continue queue\n  c       Cancel active download\n  b       Cycle browser cookie source\n  r       Toggle aria2 for direct files\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nConnections: 4–8 is usually practical. Above 8 may increase throttling or HTTP 403 risk.\n\nPress any key to close";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::bordered().title(" Help "))

@@ -99,6 +99,7 @@ Run `crusty-dlp --help` for CLI details.
 | `d` | Start or continue the queue |
 | `c` | Cancel the active download |
 | `b` | Cycle the browser used for session cookies |
+| `r` | Toggle aria2 for direct HTTP downloads |
 | `Tab` | Switch panels |
 | `Enter` / `Space` | Edit or change the selected panel |
 | `Esc` | Cancel editing |
@@ -106,6 +107,20 @@ Run `crusty-dlp --help` for CLI details.
 
 Downloads run sequentially. After a successful item, the next waiting item
 starts automatically. Failed or cancelled entries remain visible in the queue.
+
+### Parallel downloads
+
+Select the **Connections** panel and press `Enter` or `Space` to cycle through
+1, 2, 4, 8, 12, or 16 connections. The default is 4. Values from 4–8 are
+usually the practical range; using more than 8 can increase server throttling or
+HTTP 403 responses and is not guaranteed to improve speed.
+
+HLS/DASH downloads use yt-dlp's native concurrent-fragment downloader. Press
+`r` to toggle aria2 for direct HTTP/FTP files. Install it on Arch/CachyOS with:
+
+```console
+sudo pacman -S aria2
+```
 
 ### Browser impersonation
 
@@ -131,9 +146,23 @@ sudo pacman -S python-curl_cffi
 
 BoyfriendTV video-page URLs are recognized directly. When impersonation is set
 to `None`, crusty-dlp automatically asks yt-dlp's generic extractor to use any
-available target for that URL. This requires `python-curl_cffi`; the application
-shows an actionable error if it is unavailable. Support is independently
-implemented and does not copy code from the unlicensed third-party userscript.
+available target for that URL. A bundled yt-dlp extractor plugin reads the
+page's public media source list and supports direct files and HLS manifests.
+This requires `python-curl_cffi`; the application shows an actionable error if
+it is unavailable. Support is independently implemented and does not copy code
+from the unlicensed third-party userscript.
+
+### PMVHaven and SpankBang
+
+PMVHaven video URLs use the bundled extractor plugin to read the page's public
+VideoObject metadata and HLS manifest.
+
+SpankBang uses Cloudflare checks that can require a recent browser session. Open
+the video in your browser first, press `b` in crusty-dlp until the same browser
+is selected, and retry within roughly 30 minutes. The application passes cookies
+directly from that browser and aligns impersonation to its browser family; it
+does not store the cookies or bypass CAPTCHA/access controls. Close the browser
+if its cookie database is locked.
 
 ## Configuration
 
@@ -153,6 +182,8 @@ default_mode = "video"
 custom_format = "bestvideo+bestaudio/best"
 impersonation = "none"
 cookies_browser = "none"
+concurrent_fragments = 4
+use_aria2 = false
 ```
 
 ## Troubleshooting
