@@ -6,7 +6,8 @@ compatibility mechanisms for recurring failure classes.
 
 | Failure class / examples | Supported approach |
 | --- | --- |
-| TLS fingerprinting, BoyfriendTV, some anti-bot frontends | Select a target in the Impersonation panel. BoyfriendTV enables `any` automatically. |
+| TLS fingerprinting, some anti-bot frontends | Select a target in the Impersonation panel. |
+| BoyfriendTV reports `Unsupported URL` | The bundled `BoyfriendTVIE` plugin parses its public source list; crusty-dlp also enables impersonation automatically. |
 | A site works only in an already-authorized browser session; some YouTube and Rule34Video failures | Press `b` and select the local browser. Cookies are read directly by yt-dlp and never stored by crusty-dlp. |
 | YouTube JavaScript challenge warnings or missing formats | Install Deno (`sudo pacman -S deno` on Arch/CachyOS). The Arch yt-dlp package already depends on `yt-dlp-ejs`. |
 | Outdated or broken extractor | Update yt-dlp. Site extractor fixes belong upstream and should not be hard-coded into the TUI. |

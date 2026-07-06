@@ -131,9 +131,11 @@ sudo pacman -S python-curl_cffi
 
 BoyfriendTV video-page URLs are recognized directly. When impersonation is set
 to `None`, crusty-dlp automatically asks yt-dlp's generic extractor to use any
-available target for that URL. This requires `python-curl_cffi`; the application
-shows an actionable error if it is unavailable. Support is independently
-implemented and does not copy code from the unlicensed third-party userscript.
+available target for that URL. A bundled yt-dlp extractor plugin reads the
+page's public media source list and supports direct files and HLS manifests.
+This requires `python-curl_cffi`; the application shows an actionable error if
+it is unavailable. Support is independently implemented and does not copy code
+from the unlicensed third-party userscript.
 
 ## Configuration
 

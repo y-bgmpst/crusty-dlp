@@ -25,6 +25,7 @@ pub enum DownloadEvent {
 pub struct Downloader {
     executable: PathBuf,
     output_dir: PathBuf,
+    plugin_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -38,6 +39,7 @@ impl Downloader {
         Self {
             executable,
             output_dir,
+            plugin_dir: plugin_directory(),
         }
     }
 
@@ -55,6 +57,10 @@ impl Downloader {
             OsString::from("--output"),
             self.output_dir.join("%(title)s [%(id)s].%(ext)s").into_os_string(),
         ];
+        if let Some(plugin_dir) = &self.plugin_dir {
+            args.push(OsString::from("--plugin-dirs"));
+            args.push(plugin_dir.as_os_str().to_owned());
+        }
         match mode {
             DownloadMode::Video => {
                 args.extend(["--format".into(), "bestvideo*+bestaudio/best".into()])
@@ -157,6 +163,17 @@ impl Downloader {
             }
         }
     }
+}
+
+fn plugin_directory() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let directory = executable.parent()?;
+    let mut candidates: Vec<_> = directory.ancestors().take(5).map(Path::to_owned).collect();
+    #[cfg(unix)]
+    candidates.push(PathBuf::from("/usr/share/crusty-dlp"));
+    candidates
+        .into_iter()
+        .find(|path| path.join("plugins/yt_dlp_plugins/extractor").is_dir())
 }
 
 /// Ask yt-dlp itself which impersonation targets are usable. This avoids
