@@ -1,8 +1,10 @@
 # crusty-dlp
 
-`crusty-dlp` is a small terminal interface for managing a sequential `yt-dlp`
-download queue on Arch Linux and CachyOS. It invokes programs directly with
-argument arrays; URLs, paths, and custom formats are never evaluated by a shell.
+`crusty-dlp` provides native desktop and terminal interfaces for managing a
+sequential `yt-dlp` download queue on Linux, Windows, and macOS. Both interfaces
+share the same safe downloader and configuration code. Programs are invoked
+directly with argument arrays; URLs, paths, and custom formats are never
+evaluated by a shell.
 See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the supported approach to sites
 that require JavaScript, browser sessions, or TLS impersonation.
 
@@ -14,7 +16,7 @@ that require JavaScript, browser sessions, or TLS impersonation.
 - `python-curl_cffi` (optional, provides browser impersonation and is required
   for BoyfriendTV downloads)
 - `deno` (recommended for full YouTube JavaScript challenge support)
-- A normal terminal at least 70 columns by 22 rows
+- A normal terminal at least 70 columns by 22 rows when using the TUI
 
 Install system dependencies:
 
@@ -32,13 +34,16 @@ sudo pacman -S rust
 
 ```console
 cargo build --release
-./target/release/crusty-dlp
+./target/release/crusty-dlp-gui
 ```
+
+Use `./target/release/crusty-dlp` to start the terminal interface instead.
 
 To install for the current user:
 
 ```console
 install -Dm755 target/release/crusty-dlp ~/.local/bin/crusty-dlp
+install -Dm755 target/release/crusty-dlp-gui ~/.local/bin/crusty-dlp-gui
 ```
 
 Both bash and fish can run the resulting binary; no shell-specific integration
@@ -47,13 +52,14 @@ its placeholder project URL and checksum before using it to publish a package.
 
 ### Windows
 
-GitHub Releases provide two Windows assets:
+GitHub Releases provide standalone TUI and GUI executables plus a complete ZIP:
 
 - `crusty-dlp.exe` for users who already have `yt-dlp.exe` in `PATH` or beside
   the application.
-- `crusty-dlp-windows-x86_64.zip`, containing crusty-dlp and a checksum-verified
-  official `yt-dlp.exe`. Extract both files into one folder and run
-  `crusty-dlp.exe` from Windows Terminal.
+- `crusty-dlp-gui.exe` starts the native graphical interface.
+- `crusty-dlp-windows-x86_64.zip` contains both interfaces and a
+  checksum-verified official `yt-dlp.exe`. Extract the archive and run
+  `crusty-dlp-gui.exe` normally or `crusty-dlp.exe` from Windows Terminal.
 
 Install `ffmpeg` separately when using conversion or stream merging. Full
 YouTube support also needs Deno; install it with:
@@ -69,22 +75,31 @@ automatically.
 ### macOS
 
 GitHub Releases provide native Intel (`x86_64`) and Apple Silicon (`aarch64`)
-executables, plus `.tar.gz` and `.zip` bundles containing crusty-dlp, its
-extractor plugins, and a checksum-verified `yt-dlp`. Extract a bundle,
-then run:
+executables, `.app` ZIPs, DMG images, and portable archives. The bundles contain
+both interfaces, extractor plugins, and a checksum-verified `yt-dlp`. Open the
+app from a DMG or extract a portable bundle and run:
 
 ```sh
 chmod +x crusty-dlp yt-dlp
-./crusty-dlp
+./crusty-dlp-gui
 ```
 
-macOS may quarantine unsigned downloads. If Gatekeeper blocks a release you
-trust, allow it from System Settings > Privacy & Security. The artifacts are
-not currently code-signed or notarized.
+The app receives an ad-hoc signature in CI, but is not Apple-notarized. If
+Gatekeeper blocks a release you trust, allow it from System Settings > Privacy
+& Security. Full signing and notarization require Apple Developer credentials.
 
 ## Usage
 
-Start with an empty queue:
+Start the graphical interface:
+
+```console
+crusty-dlp-gui
+```
+
+The GUI provides URL entry, mode and folder selection, browser cookies,
+impersonation, connection controls, queue progress, cancellation, and logs.
+
+Start the terminal interface with an empty queue:
 
 ```console
 crusty-dlp

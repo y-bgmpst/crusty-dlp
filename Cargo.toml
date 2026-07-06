@@ -1,9 +1,9 @@
 [package]
 name = "crusty-dlp"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
-description = "A small, safe terminal UI for yt-dlp"
+description = "Safe terminal and desktop interfaces for yt-dlp"
 repository = "https://github.com/y-bgmpst/crusty-dlp"
 
 [dependencies]
@@ -16,6 +16,16 @@ serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0"
 tokio = { version = "1.43", features = ["io-util", "macros", "process", "rt", "sync"] }
 toml = "0.8"
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+
+[[bin]]
+name = "crusty-dlp"
+path = "src/main.rs"
+
+[[bin]]
+name = "crusty-dlp-gui"
+path = "src/bin/gui.rs"
 
 [dev-dependencies]
 tempfile = "3.15"
