@@ -293,6 +293,10 @@ impl App {
             },
             concurrent_fragments: self.config.concurrent_fragments,
             use_aria2: self.config.use_aria2 && self.aria2_available,
+            output_template: Some(self.config.output_template.as_str()),
+            rate_limit: (!self.config.rate_limit.trim().is_empty())
+                .then_some(self.config.rate_limit.trim()),
+            allow_playlists: self.config.allow_playlists,
         }
     }
 

@@ -1,5 +1,6 @@
 # Copy to ~/.config/crusty-dlp/config.toml
 output_dir = "/home/your-user/Downloads"
+output_template = "%(title)s [%(id)s].%(ext)s"
 # One of: video, audio, mp3, custom
 default_mode = "video"
 custom_format = "bestvideo+bestaudio/best"
@@ -10,3 +11,9 @@ cookies_browser = "none"
 # 1, 2, 4, 8, 12, or 16. Values above 8 may increase throttling/403 risk.
 concurrent_fragments = 4
 use_aria2 = false
+# Empty means unlimited. Examples: 5M, 900K, 1.5Mi
+rate_limit = ""
+# Number of simultaneous downloads in the GUI.
+max_active_downloads = 1
+# Expand supported playlist URLs such as YouTube playlists.
+allow_playlists = false

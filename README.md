@@ -13,8 +13,8 @@ that require JavaScript, browser sessions, or TLS impersonation.
 - `yt-dlp` (required)
 - `ffmpeg` (optional, required for audio extraction/MP3 and commonly needed when
   merging the best video and audio streams)
-- `python-curl_cffi` (optional, provides browser impersonation and is required
-  for BoyfriendTV downloads)
+- `python-curl_cffi` (optional, enables yt-dlp browser impersonation targets for
+  sites that need them)
 - `deno` (recommended for full YouTube JavaScript challenge support)
 - A normal terminal at least 70 columns by 22 rows when using the TUI
 
@@ -174,29 +174,21 @@ If no target is installed, crusty-dlp displays the correct Arch/CachyOS command:
 sudo pacman -S python-curl_cffi
 ```
 
-### BoyfriendTV
+### Session-gated and JavaScript-heavy sites
 
-BoyfriendTV video-page URLs are recognized directly. When impersonation is set
-to `None`, crusty-dlp automatically asks yt-dlp's generic extractor to use any
-available target for that URL. A bundled yt-dlp extractor plugin reads the
-page's public media source list and supports direct files and HLS manifests.
-This requires `python-curl_cffi`; the application shows an actionable error if
-it is unavailable. Support is independently implemented and does not copy code
-from the unlicensed third-party userscript.
+Some supported sites need a recent browser session, yt-dlp impersonation, or
+both before the page can be inspected reliably. crusty-dlp exposes those
+controls directly:
 
-### PMVHaven and SpankBang
+- choose an impersonation target when yt-dlp reports one is available
+- press `b` to use cookies from a local browser without copying cookie data into
+  the app
+- retry with a fresh browser session if the site returns anti-bot or access
+  errors
 
-PMVHaven video URLs use the bundled extractor plugin to read the page's public
-VideoObject metadata and HLS manifest.
-
-SpankBang uses a bundled extractor that reads the public `stream_data` media
-variants exposed by a video page. Cloudflare can still require a recent browser
-session before that page is available. Open the video in your browser first,
-press `b` in crusty-dlp until the same browser is selected, and retry within
-roughly 30 minutes. The application passes cookies directly from that browser
-and aligns impersonation to its browser family; it does not store the cookies or
-bypass CAPTCHA/access controls. Close the browser if its cookie database is
-locked.
+The application passes browser state through yt-dlp only for the current
+download, does not store cookie contents, and does not bypass access controls.
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) for site notes and packaging details.
 
 ## Configuration
 
@@ -212,12 +204,16 @@ changing and saving a configurable value. See [`config.example.toml`](config.exa
 
 ```toml
 output_dir = "/home/alice/Downloads"
+output_template = "%(title)s [%(id)s].%(ext)s"
 default_mode = "video"
 custom_format = "bestvideo+bestaudio/best"
 impersonation = "none"
 cookies_browser = "none"
 concurrent_fragments = 4
 use_aria2 = false
+rate_limit = ""
+max_active_downloads = 1
+allow_playlists = false
 ```
 
 ## Troubleshooting

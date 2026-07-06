@@ -1,11 +1,16 @@
-use std::{collections::VecDeque, path::PathBuf, time::Duration};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    time::Duration,
+};
 
 use crusty_dlp::{
     app::{validate_url, DownloadMode, DownloadState},
     config::Config,
     downloader::{
-        available_impersonation_targets, dependency_path, DownloadEvent, DownloadOptions,
-        Downloader,
+        available_impersonation_targets, dependency_path, expand_playlist_urls,
+        supports_playlist_expansion, validate_output_template, validate_rate_limit, DownloadEvent,
+        DownloadOptions, Downloader,
     },
 };
 use eframe::egui::{self, Color32, RichText};
@@ -20,7 +25,7 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("crusty-dlp")
             .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([920.0, 620.0]),
+            .with_min_inner_size([960.0, 660.0]),
         ..Default::default()
     };
     eframe::run_native(
@@ -39,17 +44,25 @@ struct GuiQueueItem {
     error: Option<String>,
 }
 
+#[derive(Debug)]
+struct JobEvent {
+    index: usize,
+    event: DownloadEvent,
+}
+
 struct GuiApp {
     config: Config,
     config_path: Option<PathBuf>,
     input: String,
+    output_dir_text: String,
+    output_template_text: String,
+    rate_limit_text: String,
     mode: DownloadMode,
     queue: Vec<GuiQueueItem>,
-    current: Option<usize>,
-    auto_continue: bool,
-    cancel_tx: Option<oneshot::Sender<()>>,
-    event_tx: mpsc::UnboundedSender<DownloadEvent>,
-    event_rx: mpsc::UnboundedReceiver<DownloadEvent>,
+    queue_running: bool,
+    active_downloads: HashMap<usize, oneshot::Sender<()>>,
+    event_tx: mpsc::UnboundedSender<JobEvent>,
+    event_rx: mpsc::UnboundedReceiver<JobEvent>,
     impersonation_targets: Vec<String>,
     logs: VecDeque<String>,
     status: String,
@@ -81,14 +94,16 @@ impl GuiApp {
             "yt-dlp was not found in PATH or beside the application".to_owned()
         };
         Self {
+            output_dir_text: config.output_dir.to_string_lossy().into_owned(),
+            output_template_text: config.output_template.clone(),
+            rate_limit_text: config.rate_limit.clone(),
             config,
             config_path,
             input: String::new(),
             mode,
             queue: Vec::new(),
-            current: None,
-            auto_continue: false,
-            cancel_tx: None,
+            queue_running: false,
+            active_downloads: HashMap::new(),
             event_tx,
             event_rx,
             impersonation_targets,
@@ -120,18 +135,8 @@ impl GuiApp {
         }
         let mut added = 0;
         for url in values {
-            match validate_url(&url) {
-                Ok(()) => {
-                    self.log(format!("Added to queue: {url}"));
-                    self.queue.push(GuiQueueItem {
-                        url,
-                        state: DownloadState::Waiting,
-                        progress: 0.0,
-                        progress_text: String::new(),
-                        error: None,
-                    });
-                    added += 1;
-                }
+            match self.expand_or_enqueue(&url) {
+                Ok(count) => added += count,
                 Err(error) => self.log(format!("Rejected URL: {error}")),
             }
         }
@@ -143,47 +148,151 @@ impl GuiApp {
         }
     }
 
-    fn start_queue(&mut self) {
-        self.auto_continue = true;
-        self.start_next();
+    fn expand_or_enqueue(&mut self, url: &str) -> Result<usize, String> {
+        validate_url(url).map_err(|error| error.to_string())?;
+        if self.config.allow_playlists && supports_playlist_expansion(url) {
+            let yt_dlp = dependency_path("yt-dlp").ok_or_else(|| {
+                "yt-dlp was not found in PATH or beside the application".to_owned()
+            })?;
+            match expand_playlist_urls(&yt_dlp, url) {
+                Ok(Some(entries)) => {
+                    for entry in &entries {
+                        self.enqueue_url(entry);
+                    }
+                    self.log(format!(
+                        "Expanded playlist into {} item(s): {url}",
+                        entries.len()
+                    ));
+                    return Ok(entries.len());
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.enqueue_url(url);
+        Ok(1)
     }
 
-    fn start_next(&mut self) {
-        if self.current.is_some() {
+    fn enqueue_url(&mut self, url: &str) {
+        self.log(format!("Added to queue: {url}"));
+        self.queue.push(GuiQueueItem {
+            url: url.to_owned(),
+            state: DownloadState::Waiting,
+            progress: 0.0,
+            progress_text: String::new(),
+            error: None,
+        });
+    }
+
+    fn apply_output_dir(&mut self) -> bool {
+        let trimmed = self.output_dir_text.trim();
+        if trimmed.is_empty() {
+            self.status = "Output folder cannot be empty".into();
+            return false;
+        }
+        self.config.output_dir = PathBuf::from(trimmed);
+        self.output_dir_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn apply_output_template(&mut self) -> bool {
+        let trimmed = self.output_template_text.trim();
+        if let Err(error) = validate_output_template(trimmed) {
+            self.status = error;
+            return false;
+        }
+        self.config.output_template = trimmed.to_owned();
+        self.output_template_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn apply_rate_limit(&mut self) -> bool {
+        let trimmed = self.rate_limit_text.trim();
+        if let Err(error) = validate_rate_limit(trimmed) {
+            self.status = error;
+            return false;
+        }
+        self.config.rate_limit = trimmed.to_owned();
+        self.rate_limit_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn start_queue(&mut self) {
+        if self.active_downloads.is_empty()
+            && !self
+                .queue
+                .iter()
+                .any(|item| item.state == DownloadState::Waiting)
+        {
+            self.status = "Queue is empty".into();
             return;
         }
-        let Some(index) = self
-            .queue
-            .iter()
-            .position(|item| item.state == DownloadState::Waiting)
-        else {
-            self.auto_continue = false;
-            self.status = "Queue finished".into();
-            return;
-        };
+        self.queue_running = true;
+        self.fill_slots();
+    }
+
+    fn fill_slots(&mut self) {
+        let max_active = usize::from(self.config.max_active_downloads.clamp(1, 8));
+        while self.queue_running && self.active_downloads.len() < max_active {
+            let Some(index) = self
+                .queue
+                .iter()
+                .position(|item| item.state == DownloadState::Waiting)
+            else {
+                if self.active_downloads.is_empty() {
+                    self.queue_running = false;
+                    self.status = "Queue finished".into();
+                }
+                return;
+            };
+            if !self.start_job(index) {
+                self.queue_running = false;
+                return;
+            }
+        }
+    }
+
+    fn start_job(&mut self, index: usize) -> bool {
         let Some(yt_dlp) = dependency_path("yt-dlp") else {
             self.fail(
                 index,
                 "yt-dlp was not found in PATH or beside the application",
             );
-            return;
+            return false;
         };
         if self.mode.needs_ffmpeg() && dependency_path("ffmpeg").is_none() {
             self.fail(index, "ffmpeg is required for this download mode");
-            return;
+            return false;
+        }
+        if !self.apply_output_dir() || !self.apply_output_template() || !self.apply_rate_limit() {
+            self.fail(index, &self.status.clone());
+            return false;
         }
 
         let url = self.queue[index].url.clone();
         let mode = self.mode.clone();
-        let options = OwnedDownloadOptions::from_config(&self.config, &url);
+        let options = match OwnedDownloadOptions::from_config(&self.config, &url) {
+            Ok(options) => options,
+            Err(message) => {
+                self.fail(index, &message);
+                return false;
+            }
+        };
         let downloader = Downloader::new(yt_dlp, self.config.output_dir.clone());
         let args = downloader.arguments(&url, &mode, options.borrow());
         let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (download_tx, mut download_rx) = mpsc::unbounded_channel();
         let event_tx = self.event_tx.clone();
-        self.cancel_tx = Some(cancel_tx);
-        self.current = Some(index);
+
+        self.active_downloads.insert(index, cancel_tx);
         self.queue[index].state = DownloadState::Downloading;
-        self.status = "Downloading".into();
+        self.queue[index].progress = 0.0;
+        self.queue[index].progress_text.clear();
+        self.queue[index].error = None;
+        self.status = format!("Running {} active download(s)", self.active_downloads.len());
         self.log(format!("Starting download: {url}"));
 
         std::thread::spawn(move || {
@@ -191,14 +300,27 @@ impl GuiApp {
                 .enable_all()
                 .build();
             match runtime {
-                Ok(runtime) => runtime.block_on(downloader.run(args, cancel_rx, event_tx)),
+                Ok(runtime) => runtime.block_on(async move {
+                    let forward_tx = event_tx.clone();
+                    let forward = tokio::spawn(async move {
+                        while let Some(event) = download_rx.recv().await {
+                            let _ = forward_tx.send(JobEvent { index, event });
+                        }
+                    });
+                    downloader.run(args, cancel_rx, download_tx).await;
+                    let _ = forward.await;
+                }),
                 Err(error) => {
-                    let _ = event_tx.send(DownloadEvent::Failed(format!(
-                        "could not start async runtime: {error}"
-                    )));
+                    let _ = event_tx.send(JobEvent {
+                        index,
+                        event: DownloadEvent::Failed(format!(
+                            "could not start async runtime: {error}"
+                        )),
+                    });
                 }
             }
         });
+        true
     }
 
     fn fail(&mut self, index: usize, message: &str) {
@@ -206,58 +328,65 @@ impl GuiApp {
         self.queue[index].error = Some(message.to_owned());
         self.status = message.to_owned();
         self.log(format!("ERROR: {message}"));
-        self.current = None;
-        self.auto_continue = false;
     }
 
     fn cancel(&mut self) {
-        self.auto_continue = false;
-        if let Some(cancel) = self.cancel_tx.take() {
-            let _ = cancel.send(());
-            self.status = "Cancelling download…".into();
+        self.queue_running = false;
+        if self.active_downloads.is_empty() {
+            self.status = "No active downloads".into();
+            return;
         }
+        for (_, cancel_tx) in self.active_downloads.drain() {
+            let _ = cancel_tx.send(());
+        }
+        self.status = "Cancelling active downloads…".into();
     }
 
     fn process_events(&mut self) {
-        while let Ok(event) = self.event_rx.try_recv() {
-            let Some(index) = self.current else {
+        while let Ok(job) = self.event_rx.try_recv() {
+            if job.index >= self.queue.len() {
                 continue;
-            };
-            match event {
+            }
+            match job.event {
                 DownloadEvent::Progress { percent, text } => {
-                    self.queue[index].progress = percent.unwrap_or_default() as f32 / 100.0;
-                    self.queue[index].progress_text = text;
+                    self.queue[job.index].progress = percent.unwrap_or_default() as f32 / 100.0;
+                    self.queue[job.index].progress_text = text;
                 }
                 DownloadEvent::Finished => {
-                    self.queue[index].state = DownloadState::Finished;
-                    self.queue[index].progress = 1.0;
-                    self.log(format!("Finished: {}", self.queue[index].url));
+                    self.queue[job.index].state = DownloadState::Finished;
+                    self.queue[job.index].progress = 1.0;
+                    self.queue[job.index].progress_text = "done".into();
+                    self.queue[job.index].error = None;
+                    self.active_downloads.remove(&job.index);
+                    self.log(format!("Finished: {}", self.queue[job.index].url));
                     self.status = "Download finished".into();
-                    self.current = None;
-                    self.cancel_tx = None;
-                    if self.auto_continue {
-                        self.start_next();
-                    }
                 }
                 DownloadEvent::Failed(message) => {
-                    self.queue[index].state = DownloadState::Failed;
-                    self.queue[index].error = Some(message.clone());
+                    self.queue[job.index].state = DownloadState::Failed;
+                    self.queue[job.index].error = Some(message.clone());
+                    self.active_downloads.remove(&job.index);
                     self.log(format!("ERROR: {message}"));
                     self.status = "Download failed".into();
-                    self.current = None;
-                    self.cancel_tx = None;
-                    if self.auto_continue {
-                        self.start_next();
-                    }
                 }
                 DownloadEvent::Cancelled => {
-                    self.queue[index].state = DownloadState::Cancelled;
-                    self.log(format!("Cancelled: {}", self.queue[index].url));
+                    self.queue[job.index].state = DownloadState::Cancelled;
+                    self.queue[job.index].progress_text = "cancelled".into();
+                    self.active_downloads.remove(&job.index);
+                    self.log(format!("Cancelled: {}", self.queue[job.index].url));
                     self.status = "Download cancelled".into();
-                    self.current = None;
-                    self.cancel_tx = None;
                 }
             }
+        }
+
+        if self.queue_running {
+            self.fill_slots();
+        } else if self.active_downloads.is_empty()
+            && self
+                .queue
+                .iter()
+                .all(|item| item.state != DownloadState::Waiting)
+        {
+            self.status = "Queue idle".into();
         }
     }
 
@@ -288,9 +417,9 @@ impl GuiApp {
             .selected_text(self.mode.label())
             .width(ui.available_width())
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.mode, DownloadMode::Video, "Video — best quality");
-                ui.selectable_value(&mut self.mode, DownloadMode::Audio, "Audio — best quality");
-                ui.selectable_value(&mut self.mode, DownloadMode::Mp3, "MP3 — convert audio");
+                ui.selectable_value(&mut self.mode, DownloadMode::Video, "Video - best quality");
+                ui.selectable_value(&mut self.mode, DownloadMode::Audio, "Audio - best quality");
+                ui.selectable_value(&mut self.mode, DownloadMode::Mp3, "MP3 - convert audio");
                 ui.selectable_value(
                     &mut self.mode,
                     DownloadMode::Custom(self.config.custom_format.clone()),
@@ -322,23 +451,27 @@ impl GuiApp {
         }
 
         ui.add_space(18.0);
-        ui.heading("Output folder");
+        ui.heading("Output");
+        let folder_response = ui.add(
+            egui::TextEdit::singleline(&mut self.output_dir_text)
+                .hint_text("/home/user/Downloads")
+                .desired_width(f32::INFINITY),
+        );
         ui.horizontal(|ui| {
-            let mut folder = self.config.output_dir.to_string_lossy().into_owned();
-            ui.add_enabled(
-                false,
-                egui::TextEdit::singleline(&mut folder).desired_width(ui.available_width() - 80.0),
-            );
-            if ui.button("Browse…").clicked() {
-                if let Some(path) = rfd::FileDialog::new()
-                    .set_directory(&self.config.output_dir)
-                    .pick_folder()
-                {
-                    self.config.output_dir = path;
+            if ui.button("Use typed path").clicked() {
+                self.apply_output_dir();
+            }
+            if ui.button("Browse...").clicked() {
+                if let Some(path) = self.browse_output_dir() {
+                    self.config.output_dir = path.clone();
+                    self.output_dir_text = path.display().to_string();
                     self.save_config();
                 }
             }
         });
+        if folder_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            self.apply_output_dir();
+        }
 
         ui.add_space(18.0);
         ui.heading("Cookies browser");
@@ -374,6 +507,16 @@ impl GuiApp {
                 {
                     self.save_config();
                 }
+                if ui
+                    .selectable_value(
+                        &mut self.config.impersonation,
+                        "any".into(),
+                        "Any available",
+                    )
+                    .changed()
+                {
+                    self.save_config();
+                }
                 for target in self.impersonation_targets.clone() {
                     if ui
                         .selectable_value(&mut self.config.impersonation, target.clone(), &target)
@@ -385,8 +528,44 @@ impl GuiApp {
             });
 
         ui.add_space(18.0);
-        ui.heading("Connections");
+        egui::CollapsingHeader::new("Advanced yt-dlp options")
+            .default_open(true)
+            .show(ui, |ui| self.advanced_settings_panel(ui));
+    }
+
+    fn browse_output_dir(&mut self) -> Option<PathBuf> {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.status = format!("Could not start folder picker runtime: {error}");
+                return None;
+            }
+        };
+        let _guard = runtime.enter();
+        rfd::FileDialog::new()
+            .set_directory(&self.config.output_dir)
+            .pick_folder()
+    }
+
+    fn advanced_settings_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Filename template").strong());
+        let template_response = ui.add(
+            egui::TextEdit::singleline(&mut self.output_template_text)
+                .hint_text("%(title)s [%(id)s].%(ext)s")
+                .desired_width(f32::INFINITY),
+        );
+        if template_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            self.apply_output_template();
+        }
+        ui.small("Maps to yt-dlp --output and must stay relative to the output folder.");
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("Transfer").strong());
         ui.horizontal(|ui| {
+            ui.label("Connections");
             if ui
                 .add(egui::Slider::new(
                     &mut self.config.concurrent_fragments,
@@ -396,11 +575,57 @@ impl GuiApp {
             {
                 self.save_config();
             }
-            if ui.checkbox(&mut self.config.use_aria2, "aria2").changed() {
+        });
+        if ui
+            .checkbox(&mut self.config.use_aria2, "Use aria2")
+            .changed()
+        {
+            self.save_config();
+        }
+        ui.small("More than 8 connections can increase throttling or HTTP 403 errors.");
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Parallel downloads");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.config.max_active_downloads)
+                        .range(1..=8)
+                        .speed(0.1),
+                )
+                .changed()
+            {
+                self.config.max_active_downloads = self.config.max_active_downloads.clamp(1, 8);
                 self.save_config();
             }
         });
-        ui.small("More than 8 connections can increase throttling or HTTP 403 errors.");
+
+        if ui
+            .checkbox(
+                &mut self.config.allow_playlists,
+                "Allow playlists (supported: YouTube, PMVHaven, SpankBang)",
+            )
+            .changed()
+        {
+            self.save_config();
+        }
+        ui.small("Disabled by default. Supported playlist URLs are expanded into queue entries before downloading.");
+
+        ui.horizontal(|ui| {
+            ui.label("Speed limit");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.rate_limit_text)
+                    .hint_text("blank = unlimited, e.g. 5M")
+                    .desired_width(170.0),
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.apply_rate_limit();
+            }
+            if ui.button("Apply").clicked() {
+                self.apply_rate_limit();
+            }
+        });
+        ui.small("The limit applies per active download process.");
     }
 
     fn queue_panel(&mut self, ui: &mut egui::Ui) {
@@ -408,7 +633,10 @@ impl GuiApp {
             ui.heading(format!("Queue ({})", self.queue.len()));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(self.current.is_none(), egui::Button::new("Clear completed"))
+                    .add_enabled(
+                        self.active_downloads.is_empty(),
+                        egui::Button::new("Clear completed"),
+                    )
                     .clicked()
                 {
                     self.queue.retain(|item| {
@@ -419,7 +647,6 @@ impl GuiApp {
                                 | DownloadState::Cancelled
                         )
                     });
-                    self.current = None;
                 }
             });
         });
@@ -453,13 +680,18 @@ impl GuiApp {
                                 },
                             );
                         });
-                        if item.state == DownloadState::Downloading {
+                        if matches!(
+                            item.state,
+                            DownloadState::Downloading | DownloadState::Finished
+                        ) {
                             ui.add(
                                 egui::ProgressBar::new(item.progress)
                                     .desired_width(ui.available_width())
                                     .show_percentage(),
                             );
-                            ui.small(&item.progress_text);
+                            if !item.progress_text.is_empty() {
+                                ui.small(&item.progress_text);
+                            }
                         }
                         if let Some(error) = &item.error {
                             ui.label(RichText::new(error).color(RED));
@@ -470,25 +702,43 @@ impl GuiApp {
             });
 
         ui.add_space(10.0);
-        if let Some(index) = self.current {
-            ui.heading("Now downloading");
-            ui.label(RichText::new(short_url(&self.queue[index].url)).strong());
-            ui.add(
-                egui::ProgressBar::new(self.queue[index].progress)
-                    .desired_width(ui.available_width())
-                    .show_percentage(),
-            );
+        ui.heading(format!(
+            "Active downloads ({}/{})",
+            self.active_downloads.len(),
+            self.config.max_active_downloads.clamp(1, 8)
+        ));
+        if self.active_downloads.is_empty() {
+            ui.label("No active downloads");
+        } else {
+            for index in active_indices(&self.active_downloads) {
+                if let Some(item) = self.queue.get(index) {
+                    ui.label(RichText::new(short_url(&item.url)).strong());
+                    ui.add(
+                        egui::ProgressBar::new(item.progress)
+                            .desired_width(ui.available_width())
+                            .show_percentage(),
+                    );
+                    if !item.progress_text.is_empty() {
+                        ui.small(&item.progress_text);
+                    }
+                    ui.add_space(6.0);
+                }
+            }
         }
+
         ui.horizontal(|ui| {
             let start = ui.add_sized(
                 [ui.available_width() * 0.65, 40.0],
-                egui::Button::new(RichText::new("▶  Start Queue").strong()).fill(BLUE),
+                egui::Button::new(RichText::new("Start queue").strong()).fill(BLUE),
             );
             if start.clicked() {
                 self.start_queue();
             }
             if ui
-                .add_sized([ui.available_width(), 40.0], egui::Button::new("■  Cancel"))
+                .add_sized(
+                    [ui.available_width(), 40.0],
+                    egui::Button::new("Cancel active"),
+                )
                 .clicked()
             {
                 self.cancel();
@@ -519,7 +769,7 @@ impl eframe::App for GuiApp {
         self.process_events();
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(RichText::new("🦀  crusty-dlp").strong());
+                ui.heading(RichText::new("crusty-dlp").strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(&self.status);
                 });
@@ -527,9 +777,15 @@ impl eframe::App for GuiApp {
         });
         egui::SidePanel::left("settings")
             .resizable(false)
-            .default_width(350.0)
+            .default_width(380.0)
+            .min_width(380.0)
+            .max_width(380.0)
             .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.settings_panel(ui));
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| self.settings_panel(ui));
+                    });
             });
         egui::CentralPanel::default().show(ctx, |ui| self.queue_panel(ui));
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
@@ -537,7 +793,7 @@ impl eframe::App for GuiApp {
                 let yt_dlp = dependency_path("yt-dlp")
                     .map(|path| path.display().to_string())
                     .unwrap_or_else(|| "not found".into());
-                ui.label(format!("● yt-dlp: {yt_dlp}"));
+                ui.label(format!("yt-dlp: {yt_dlp}"));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let waiting = self
                         .queue
@@ -545,6 +801,8 @@ impl eframe::App for GuiApp {
                         .filter(|item| item.state == DownloadState::Waiting)
                         .count();
                     ui.label(format!("{waiting} queued"));
+                    ui.separator();
+                    ui.label(format!("{} active", self.active_downloads.len()));
                 });
             });
         });
@@ -557,10 +815,16 @@ struct OwnedDownloadOptions {
     cookies_browser: Option<String>,
     concurrent_fragments: u8,
     use_aria2: bool,
+    output_template: String,
+    rate_limit: Option<String>,
+    allow_playlists: bool,
 }
 
 impl OwnedDownloadOptions {
-    fn from_config(config: &Config, url: &str) -> Self {
+    fn from_config(config: &Config, url: &str) -> Result<Self, String> {
+        validate_output_template(&config.output_template)?;
+        validate_rate_limit(&config.rate_limit)?;
+
         let browser = (config.cookies_browser != "none").then(|| config.cookies_browser.clone());
         let mut impersonation =
             (config.impersonation != "none").then(|| config.impersonation.clone());
@@ -569,13 +833,20 @@ impl OwnedDownloadOptions {
                 .as_deref()
                 .map(browser_impersonation)
                 .map(str::to_owned);
+        } else if url.contains("boyfriendtv.com") && impersonation.is_none() {
+            impersonation = Some("any".into());
         }
-        Self {
+
+        Ok(Self {
             impersonation,
             cookies_browser: browser,
             concurrent_fragments: config.concurrent_fragments.clamp(1, 16),
             use_aria2: config.use_aria2 && dependency_path("aria2c").is_some(),
-        }
+            output_template: config.output_template.trim().to_owned(),
+            rate_limit: (!config.rate_limit.trim().is_empty())
+                .then(|| config.rate_limit.trim().to_owned()),
+            allow_playlists: config.allow_playlists,
+        })
     }
 
     fn borrow(&self) -> DownloadOptions<'_> {
@@ -584,6 +855,9 @@ impl OwnedDownloadOptions {
             cookies_browser: self.cookies_browser.as_deref(),
             concurrent_fragments: self.concurrent_fragments,
             use_aria2: self.use_aria2,
+            output_template: Some(self.output_template.as_str()),
+            rate_limit: self.rate_limit.as_deref(),
+            allow_playlists: self.allow_playlists,
         }
     }
 }
@@ -600,6 +874,12 @@ fn configure_style(ctx: &egui::Context) {
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
     ctx.set_style(style);
+}
+
+fn active_indices(active_downloads: &HashMap<usize, oneshot::Sender<()>>) -> Vec<usize> {
+    let mut indices: Vec<_> = active_downloads.keys().copied().collect();
+    indices.sort_unstable();
+    indices
 }
 
 fn state_color(state: DownloadState) -> Color32 {

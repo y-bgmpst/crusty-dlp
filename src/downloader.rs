@@ -34,6 +34,9 @@ pub struct DownloadOptions<'a> {
     pub cookies_browser: Option<&'a str>,
     pub concurrent_fragments: u8,
     pub use_aria2: bool,
+    pub output_template: Option<&'a str>,
+    pub rate_limit: Option<&'a str>,
+    pub allow_playlists: bool,
 }
 
 impl Default for DownloadOptions<'_> {
@@ -43,6 +46,9 @@ impl Default for DownloadOptions<'_> {
             cookies_browser: None,
             concurrent_fragments: 4,
             use_aria2: false,
+            output_template: None,
+            rate_limit: None,
+            allow_playlists: false,
         }
     }
 }
@@ -64,18 +70,30 @@ impl Downloader {
     ) -> Vec<OsString> {
         let mut args = vec![
             OsString::from("--newline"),
-            OsString::from("--no-playlist"),
             OsString::from("--progress-template"),
             OsString::from("download:crusty-dlp:%(progress._percent_str)s|%(progress._speed_str)s|%(progress._eta_str)s"),
             OsString::from("--output"),
-            self.output_dir.join("%(title)s [%(id)s].%(ext)s").into_os_string(),
+            self.output_dir
+                .join(
+                    options
+                        .output_template
+                        .unwrap_or("%(title)s [%(id)s].%(ext)s"),
+                )
+                .into_os_string(),
         ];
+        if !options.allow_playlists {
+            args.push(OsString::from("--no-playlist"));
+        }
         if let Some(plugin_dir) = &self.plugin_dir {
             args.push(OsString::from("--plugin-dirs"));
             args.push(plugin_dir.as_os_str().to_owned());
         }
         args.push(OsString::from("--concurrent-fragments"));
         args.push(OsString::from(options.concurrent_fragments.to_string()));
+        if let Some(rate_limit) = options.rate_limit {
+            args.push(OsString::from("--limit-rate"));
+            args.push(OsString::from(rate_limit));
+        }
         if options.use_aria2 {
             args.extend([
                 OsString::from("--downloader"),
@@ -276,6 +294,110 @@ pub fn dependency_path(name: &str) -> Option<PathBuf> {
     })
 }
 
+pub fn supports_playlist_expansion(url: &str) -> bool {
+    is_youtube_playlist_url(url) || is_pmvhaven_playlist_url(url) || is_spankbang_playlist_url(url)
+}
+
+pub fn expand_playlist_urls(executable: &Path, url: &str) -> Result<Option<Vec<String>>, String> {
+    if !supports_playlist_expansion(url) {
+        return Ok(None);
+    }
+
+    let output = StdCommand::new(executable)
+        .args([
+            "--flat-playlist",
+            "--print",
+            "%(id)s\t%(webpage_url)s\t%(url)s",
+            "--",
+        ])
+        .arg(url)
+        .output()
+        .map_err(|error| format!("could not inspect playlist: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("yt-dlp could not inspect the playlist");
+        return Err(message.to_owned());
+    }
+
+    let source = playlist_source(url);
+    let entries = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| parse_flat_playlist_line(line, source))
+        .collect::<Vec<_>>();
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(entries))
+}
+
+pub fn validate_output_template(template: &str) -> Result<(), String> {
+    let trimmed = template.trim();
+    if trimmed.is_empty() {
+        return Err("Filename template cannot be empty".into());
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err("Filename template must stay inside the output folder".into());
+    }
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return Err("Filename template cannot use absolute paths or '..'".into());
+    }
+    Ok(())
+}
+
+pub fn validate_rate_limit(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let Some(first) = trimmed.chars().next() else {
+        return Ok(());
+    };
+    if !first.is_ascii_digit() {
+        return Err("Speed limit must start with a number, for example 5M or 800K".into());
+    }
+
+    let mut seen_dot = false;
+    let mut suffix = String::new();
+    for ch in trimmed.chars() {
+        if ch.is_ascii_digit() {
+            if !suffix.is_empty() {
+                return Err("Speed limit suffix must appear at the end".into());
+            }
+            continue;
+        }
+        if ch == '.' {
+            if seen_dot || !suffix.is_empty() {
+                return Err("Speed limit can contain at most one decimal point".into());
+            }
+            seen_dot = true;
+            continue;
+        }
+        suffix.push(ch);
+    }
+
+    let suffix = suffix.to_ascii_lowercase();
+    if matches!(
+        suffix.as_str(),
+        "" | "k" | "m" | "g" | "t" | "ki" | "mi" | "gi" | "ti"
+    ) {
+        Ok(())
+    } else {
+        Err("Use yt-dlp suffixes such as K, M, G, Ki, or Mi".into())
+    }
+}
+
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -287,6 +409,83 @@ fn is_executable(path: &Path) -> bool {
 #[cfg(not(unix))]
 fn is_executable(path: &Path) -> bool {
     path.is_file()
+}
+
+fn url_host_matches(value: &str, expected: &str) -> bool {
+    let Some((_, remainder)) = value.split_once("://") else {
+        return false;
+    };
+    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = authority
+        .rsplit('@')
+        .next()
+        .unwrap_or_default()
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == expected || host.ends_with(&format!(".{expected}"))
+}
+
+fn parse_flat_playlist_line(line: &str, source: PlaylistSource) -> Option<String> {
+    let mut fields = line.splitn(3, '\t');
+    let id = fields.next().and_then(non_empty_trimmed);
+    let webpage_url = fields.next().and_then(non_empty_trimmed);
+    let media_url = fields.next().and_then(non_empty_trimmed);
+
+    webpage_url
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+        .map(str::to_owned)
+        .or_else(|| {
+            media_url
+                .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+                .map(str::to_owned)
+        })
+        .or_else(|| fallback_playlist_entry_url(source, id))
+}
+
+fn non_empty_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn is_youtube_playlist_url(url: &str) -> bool {
+    (url_host_matches(url, "youtube.com") || url_host_matches(url, "youtu.be"))
+        && (url.contains("list=") || url.contains("/playlist"))
+}
+
+fn is_pmvhaven_playlist_url(url: &str) -> bool {
+    url_host_matches(url, "pmvhaven.com") && url.contains("/playlists/")
+}
+
+fn is_spankbang_playlist_url(url: &str) -> bool {
+    url_host_matches(url, "spankbang.com") && url.contains("/playlist/")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaylistSource {
+    YouTube,
+    PmvHaven,
+    SpankBang,
+}
+
+fn playlist_source(url: &str) -> PlaylistSource {
+    if is_pmvhaven_playlist_url(url) {
+        PlaylistSource::PmvHaven
+    } else if is_spankbang_playlist_url(url) {
+        PlaylistSource::SpankBang
+    } else {
+        PlaylistSource::YouTube
+    }
+}
+
+fn fallback_playlist_entry_url(source: PlaylistSource, id: Option<&str>) -> Option<String> {
+    let id = id?;
+    match source {
+        PlaylistSource::YouTube => Some(format!("https://www.youtube.com/watch?v={id}")),
+        PlaylistSource::PmvHaven => Some(format!("https://pmvhaven.com/video/{id}")),
+        PlaylistSource::SpankBang => Some(format!("https://spankbang.com/{id}/video/{id}")),
+    }
 }
 
 #[cfg(test)]
@@ -382,10 +581,123 @@ mod tests {
     }
 
     #[test]
+    fn output_template_and_rate_limit_are_separate_arguments() {
+        let downloader = Downloader::new("yt-dlp".into(), "/tmp/out".into());
+        let args = downloader.arguments(
+            "https://example.com/video.mp4",
+            &DownloadMode::Video,
+            DownloadOptions {
+                output_template: Some("custom/%(title)s.%(ext)s"),
+                rate_limit: Some("5M"),
+                allow_playlists: true,
+                ..DownloadOptions::default()
+            },
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--limit-rate" && pair[1] == "5M"));
+        assert!(args.windows(2).any(|pair| {
+            pair[0] == "--output" && pair[1] == "/tmp/out/custom/%(title)s.%(ext)s"
+        }));
+    }
+
+    #[test]
+    fn rejects_unsafe_output_template() {
+        assert!(validate_output_template("../bad.%(ext)s").is_err());
+        assert!(validate_output_template("/abs/bad.%(ext)s").is_err());
+        assert!(validate_output_template("safe/%(title)s.%(ext)s").is_ok());
+    }
+
+    #[test]
+    fn validates_rate_limit_syntax() {
+        assert!(validate_rate_limit("").is_ok());
+        assert!(validate_rate_limit("5M").is_ok());
+        assert!(validate_rate_limit("1.5Mi").is_ok());
+        assert!(validate_rate_limit("fast").is_err());
+        assert!(validate_rate_limit("5MBps").is_err());
+    }
+
+    #[test]
     fn parses_private_progress_lines() {
         match parse_progress("crusty-dlp: 42.5%|2MiB/s|00:10").unwrap() {
             DownloadEvent::Progress { percent, .. } => assert_eq!(percent, Some(42.5)),
             _ => panic!("wrong event"),
         }
+    }
+
+    #[test]
+    fn defaults_to_no_playlist() {
+        let downloader = Downloader::new("yt-dlp".into(), ".".into());
+        let args = downloader.arguments(
+            "https://www.youtube.com/playlist?list=abc",
+            &DownloadMode::Video,
+            DownloadOptions::default(),
+        );
+        assert!(args.contains(&OsString::from("--no-playlist")));
+    }
+
+    #[test]
+    fn omits_no_playlist_when_enabled() {
+        let downloader = Downloader::new("yt-dlp".into(), ".".into());
+        let args = downloader.arguments(
+            "https://www.youtube.com/playlist?list=abc",
+            &DownloadMode::Video,
+            DownloadOptions {
+                allow_playlists: true,
+                ..DownloadOptions::default()
+            },
+        );
+        assert!(!args.contains(&OsString::from("--no-playlist")));
+    }
+
+    #[test]
+    fn detects_supported_playlist_hosts() {
+        assert!(supports_playlist_expansion(
+            "https://www.youtube.com/playlist?list=abc"
+        ));
+        assert!(supports_playlist_expansion(
+            "https://youtu.be/abc123?list=xyz"
+        ));
+        assert!(supports_playlist_expansion(
+            "https://pmvhaven.com/playlists/6a4c1cd09691afef03ece49b"
+        ));
+        assert!(supports_playlist_expansion(
+            "https://spankbang.com/1abc/playlist/test-list"
+        ));
+        assert!(!supports_playlist_expansion(
+            "https://spankbang.com/1abc/video/test-video"
+        ));
+    }
+
+    #[test]
+    fn parses_flat_playlist_entries() {
+        let urls = [
+            "abc123\thttps://www.youtube.com/watch?v=abc123\tabc123",
+            "def456\t\tdef456",
+            "ghi789\t\thttps://spankbang.com/ghi789/video/ghi789",
+        ]
+        .into_iter()
+        .filter_map(|line| parse_flat_playlist_line(line, PlaylistSource::YouTube))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            urls,
+            vec![
+                "https://www.youtube.com/watch?v=abc123",
+                "https://www.youtube.com/watch?v=def456",
+                "https://spankbang.com/ghi789/video/ghi789",
+            ]
+        );
+    }
+
+    #[test]
+    fn falls_back_to_site_specific_playlist_urls() {
+        assert_eq!(
+            parse_flat_playlist_line("pmv001\t\t", PlaylistSource::PmvHaven),
+            Some("https://pmvhaven.com/video/pmv001".into())
+        );
+        assert_eq!(
+            parse_flat_playlist_line("sb001\t\t", PlaylistSource::SpankBang),
+            Some("https://spankbang.com/sb001/video/sb001".into())
+        );
     }
 }
