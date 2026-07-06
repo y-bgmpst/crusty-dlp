@@ -62,8 +62,25 @@ YouTube support also needs Deno; install it with:
 winget install DenoLand.Deno
 ```
 
-Every push is tested natively on Linux and Windows. Version tags matching `v*`
-build and attach the EXE and ZIP to a GitHub Release automatically.
+Every push is tested natively on Linux, Windows, and macOS. Version tags
+matching `v*` build and attach the platform archives to a GitHub Release
+automatically.
+
+### macOS
+
+GitHub Releases provide native Intel (`x86_64`) and Apple Silicon (`aarch64`)
+executables, plus `.tar.gz` and `.zip` bundles containing crusty-dlp, its
+extractor plugins, and a checksum-verified `yt-dlp`. Extract a bundle,
+then run:
+
+```sh
+chmod +x crusty-dlp yt-dlp
+./crusty-dlp
+```
+
+macOS may quarantine unsigned downloads. If Gatekeeper blocks a release you
+trust, allow it from System Settings > Privacy & Security. The artifacts are
+not currently code-signed or notarized.
 
 ## Usage
 
@@ -157,12 +174,14 @@ from the unlicensed third-party userscript.
 PMVHaven video URLs use the bundled extractor plugin to read the page's public
 VideoObject metadata and HLS manifest.
 
-SpankBang uses Cloudflare checks that can require a recent browser session. Open
-the video in your browser first, press `b` in crusty-dlp until the same browser
-is selected, and retry within roughly 30 minutes. The application passes cookies
-directly from that browser and aligns impersonation to its browser family; it
-does not store the cookies or bypass CAPTCHA/access controls. Close the browser
-if its cookie database is locked.
+SpankBang uses a bundled extractor that reads the public `stream_data` media
+variants exposed by a video page. Cloudflare can still require a recent browser
+session before that page is available. Open the video in your browser first,
+press `b` in crusty-dlp until the same browser is selected, and retry within
+roughly 30 minutes. The application passes cookies directly from that browser
+and aligns impersonation to its browser family; it does not store the cookies or
+bypass CAPTCHA/access controls. Close the browser if its cookie database is
+locked.
 
 ## Configuration
 
