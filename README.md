@@ -99,6 +99,7 @@ Run `crusty-dlp --help` for CLI details.
 | `d` | Start or continue the queue |
 | `c` | Cancel the active download |
 | `b` | Cycle the browser used for session cookies |
+| `r` | Toggle aria2 for direct HTTP downloads |
 | `Tab` | Switch panels |
 | `Enter` / `Space` | Edit or change the selected panel |
 | `Esc` | Cancel editing |
@@ -106,6 +107,20 @@ Run `crusty-dlp --help` for CLI details.
 
 Downloads run sequentially. After a successful item, the next waiting item
 starts automatically. Failed or cancelled entries remain visible in the queue.
+
+### Parallel downloads
+
+Select the **Connections** panel and press `Enter` or `Space` to cycle through
+1, 2, 4, 8, 12, or 16 connections. The default is 4. Values from 4–8 are
+usually the practical range; using more than 8 can increase server throttling or
+HTTP 403 responses and is not guaranteed to improve speed.
+
+HLS/DASH downloads use yt-dlp's native concurrent-fragment downloader. Press
+`r` to toggle aria2 for direct HTTP/FTP files. Install it on Arch/CachyOS with:
+
+```console
+sudo pacman -S aria2
+```
 
 ### Browser impersonation
 
@@ -155,6 +170,8 @@ default_mode = "video"
 custom_format = "bestvideo+bestaudio/best"
 impersonation = "none"
 cookies_browser = "none"
+concurrent_fragments = 4
+use_aria2 = false
 ```
 
 ## Troubleshooting

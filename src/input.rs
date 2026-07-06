@@ -47,6 +47,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('d') => app.request_start(),
         KeyCode::Char('c') => app.cancel(),
         KeyCode::Char('b') => app.cycle_cookies_browser(),
+        KeyCode::Char('r') => app.toggle_aria2(),
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Tab => app.cycle_panel(),
         KeyCode::Enter | KeyCode::Char(' ') => app.edit_current_panel(),

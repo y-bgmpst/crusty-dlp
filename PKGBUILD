@@ -1,6 +1,6 @@
 # Maintainer: crusty-dlp contributors
 pkgname=crusty-dlp
-pkgver=0.3.1
+pkgver=0.3.2
 pkgrel=1
 pkgdesc='Small terminal UI for safe yt-dlp download queues'
 arch=('x86_64' 'aarch64')
@@ -11,6 +11,7 @@ optdepends=(
   'ffmpeg: audio extraction, conversion, and format merging'
   'python-curl_cffi: browser request impersonation and BoyfriendTV support'
   'deno: JavaScript challenge solving for full YouTube support'
+  'aria2: multi-connection downloads for direct HTTP files'
 )
 makedepends=('cargo')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/v$pkgver.tar.gz")

@@ -63,6 +63,7 @@ pub enum Panel {
     Url,
     Mode,
     Impersonation,
+    Connections,
     Output,
     Queue,
 }
@@ -85,6 +86,7 @@ pub struct App {
     pub progress_text: String,
     pub impersonation_targets: Vec<String>,
     pub show_install_prompt: bool,
+    pub aria2_available: bool,
     start_requested: bool,
     cancel_tx: Option<oneshot::Sender<()>>,
 }
@@ -96,6 +98,7 @@ impl App {
         dry_run: bool,
         debug: bool,
         impersonation_targets: Vec<String>,
+        aria2_available: bool,
     ) -> Self {
         let mode = match config.default_mode.as_str() {
             "audio" => DownloadMode::Audio,
@@ -121,6 +124,7 @@ impl App {
             progress_text: String::new(),
             impersonation_targets,
             show_install_prompt: false,
+            aria2_available,
             start_requested: false,
             cancel_tx: None,
         }
@@ -156,7 +160,8 @@ impl App {
         self.panel = match self.panel {
             Panel::Url => Panel::Mode,
             Panel::Mode => Panel::Impersonation,
-            Panel::Impersonation => Panel::Output,
+            Panel::Impersonation => Panel::Connections,
+            Panel::Connections => Panel::Output,
             Panel::Output => Panel::Queue,
             Panel::Queue => Panel::Url,
         };
@@ -193,6 +198,7 @@ impl App {
             }
             Panel::Mode => self.cycle_mode(),
             Panel::Impersonation => self.cycle_impersonation(),
+            Panel::Connections => self.cycle_connections(),
             Panel::Queue => {}
         }
     }
@@ -222,6 +228,7 @@ impl App {
                 self.save_config();
             }
             Panel::Impersonation => {}
+            Panel::Connections => {}
             Panel::Queue => {}
         }
     }
@@ -271,7 +278,28 @@ impl App {
                 "none" => None,
                 browser => Some(browser),
             },
+            concurrent_fragments: self.config.concurrent_fragments,
+            use_aria2: self.config.use_aria2 && self.aria2_available,
         }
+    }
+
+    pub fn cycle_connections(&mut self) {
+        const CONNECTIONS: &[u8] = &[1, 2, 4, 8, 12, 16];
+        let current = CONNECTIONS
+            .iter()
+            .position(|value| *value == self.config.concurrent_fragments)
+            .unwrap_or(2);
+        self.config.concurrent_fragments = CONNECTIONS[(current + 1) % CONNECTIONS.len()];
+        self.save_config();
+    }
+
+    pub fn toggle_aria2(&mut self) {
+        if !self.aria2_available {
+            self.message = "aria2c not found; install: sudo pacman -S aria2".into();
+            return;
+        }
+        self.config.use_aria2 = !self.config.use_aria2;
+        self.save_config();
     }
 
     pub fn cycle_cookies_browser(&mut self) {
@@ -447,6 +475,7 @@ mod tests {
             false,
             false,
             Vec::new(),
+            false,
         );
         app.queue.push_back(QueueItem {
             url: "https://example.com/old".into(),

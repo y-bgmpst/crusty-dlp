@@ -28,10 +28,23 @@ pub struct Downloader {
     plugin_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct DownloadOptions<'a> {
     pub impersonation: Option<&'a str>,
     pub cookies_browser: Option<&'a str>,
+    pub concurrent_fragments: u8,
+    pub use_aria2: bool,
+}
+
+impl Default for DownloadOptions<'_> {
+    fn default() -> Self {
+        Self {
+            impersonation: None,
+            cookies_browser: None,
+            concurrent_fragments: 4,
+            use_aria2: false,
+        }
+    }
 }
 
 impl Downloader {
@@ -60,6 +73,19 @@ impl Downloader {
         if let Some(plugin_dir) = &self.plugin_dir {
             args.push(OsString::from("--plugin-dirs"));
             args.push(plugin_dir.as_os_str().to_owned());
+        }
+        args.push(OsString::from("--concurrent-fragments"));
+        args.push(OsString::from(options.concurrent_fragments.to_string()));
+        if options.use_aria2 {
+            args.extend([
+                OsString::from("--downloader"),
+                OsString::from("http,ftp:aria2c"),
+                OsString::from("--downloader-args"),
+                OsString::from(format!(
+                    "aria2c:-x {} -s {} -k 1M",
+                    options.concurrent_fragments, options.concurrent_fragments
+                )),
+            ]);
         }
         match mode {
             DownloadMode::Video => {
@@ -328,6 +354,27 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--cookies-from-browser" && pair[1] == "firefox"));
+    }
+
+    #[test]
+    fn connection_count_and_aria2_are_bounded_arguments() {
+        let downloader = Downloader::new("yt-dlp".into(), ".".into());
+        let args = downloader.arguments(
+            "https://example.com/video.mp4",
+            &DownloadMode::Video,
+            DownloadOptions {
+                concurrent_fragments: 8,
+                use_aria2: true,
+                ..DownloadOptions::default()
+            },
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--concurrent-fragments" && pair[1] == "8"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--downloader" && pair[1] == "http,ftp:aria2c"));
+        assert!(args.contains(&OsString::from("aria2c:-x 8 -s 8 -k 1M")));
     }
 
     #[test]

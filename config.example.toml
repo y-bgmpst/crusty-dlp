@@ -7,3 +7,6 @@ custom_format = "bestvideo+bestaudio/best"
 impersonation = "none"
 # none, firefox, chrome, chromium, brave, vivaldi, edge
 cookies_browser = "none"
+# 1, 2, 4, 8, 12, or 16. Values above 8 may increase throttling/403 risk.
+concurrent_fragments = 4
+use_aria2 = false
