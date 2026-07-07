@@ -12,7 +12,7 @@ jobs:
   linux:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked --bins
       - name: Package Linux bundle
@@ -31,7 +31,7 @@ jobs:
           chmod +x dist/bundle/crusty-dlp dist/bundle/crusty-dlp-gui dist/bundle/yt-dlp
           tar -C dist/bundle -czf dist/crusty-dlp-linux-x86_64.tar.gz .
           cd dist/bundle && zip -9r ../crusty-dlp-linux-x86_64.zip .
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: |
@@ -41,7 +41,7 @@ jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo build --release --locked --bins
       - name: Package Windows bundle
@@ -61,7 +61,7 @@ jobs:
           $actual = (Get-FileHash dist/bundle/yt-dlp.exe -Algorithm SHA256).Hash.ToLowerInvariant()
           if ($actual -ne $expected.ToLowerInvariant()) { throw "yt-dlp.exe checksum mismatch" }
           Compress-Archive dist/bundle/* dist/crusty-dlp-windows-x86_64.zip
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           path: |
@@ -81,7 +81,7 @@ jobs:
             asset: macos-aarch64
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -125,7 +125,7 @@ jobs:
           codesign --force --deep --sign - "$app"
           ditto -c -k --sequesterRsrc --keepParent "$app" "dist/crusty-dlp-$ASSET-app.zip"
           hdiutil create -volname crusty-dlp -srcfolder "$app" -ov -format UDZO "dist/crusty-dlp-$ASSET.dmg"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.asset }}
           path: |
@@ -141,7 +141,7 @@ jobs:
     needs: [linux, windows, macos]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true

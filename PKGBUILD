@@ -1,11 +1,12 @@
 # Maintainer: crusty-dlp contributors
 pkgname=crusty-dlp
 pkgver=0.5.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Safe terminal and desktop interfaces for yt-dlp download queues'
 arch=('x86_64' 'aarch64')
 url='https://github.com/y-bgmpst/crusty-dlp'
 license=('MIT')
+install="$pkgname.install"
 depends=('yt-dlp')
 optdepends=(
   'ffmpeg: audio extraction, conversion, and format merging'
