@@ -72,7 +72,11 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
         .split(area);
     let top = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .constraints([
+            Constraint::Percentage(38),
+            Constraint::Percentage(30),
+            Constraint::Percentage(32),
+        ])
         .split(rows[0]);
     let bottom = Layout::default()
         .direction(Direction::Horizontal)
@@ -93,6 +97,29 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
             .block(panel_block(" URL input ", app.panel == Panel::Url)),
         top[0],
     );
+    let search_text = if app.editing && app.panel == Panel::Search {
+        format!("{}\nPlatform: {}", app.input, app.search_platform().label())
+    } else if app.search_query.trim().is_empty() {
+        format!(
+            "Press s to enter search\nPlatform: {} (p cycles, o opens)",
+            app.search_platform().label()
+        )
+    } else {
+        format!(
+            "{}\nPlatform: {} (p cycles, o opens)",
+            app.search_query,
+            app.search_platform().label()
+        )
+    };
+    frame.render_widget(
+        Paragraph::new(search_text)
+            .wrap(Wrap { trim: false })
+            .block(panel_block(
+                " Search in browser ",
+                app.panel == Panel::Search,
+            )),
+        top[1],
+    );
     let output = if app.editing && app.panel == Panel::Output {
         app.input.as_str().into()
     } else {
@@ -102,7 +129,7 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
         Paragraph::new(output)
             .wrap(Wrap { trim: false })
             .block(panel_block(" Output folder ", app.panel == Panel::Output)),
-        top[1],
+        top[2],
     );
     let mode_detail = if app.editing && app.panel == Panel::Mode {
         format!("Custom format\n{}", app.input)
@@ -222,7 +249,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
     let text = format!(
-        "{}{}   │ cookies:{} │ q quit a add d download c cancel b browser Tab panels ? help",
+        "{}{}   │ cookies:{} │ q quit a add s search p platform o open d download c cancel b browser Tab panels ? help",
         app.message,
         debug,
         app.cookies_browser_label()
@@ -238,7 +265,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(68, 20, area);
     frame.render_widget(Clear, popup);
-    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  d       Start/continue queue\n  c       Cancel active download\n  b       Cycle browser cookie source\n  r       Toggle aria2 for direct files\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nConnections: 4–8 is usually practical. Above 8 may increase throttling or HTTP 403 risk.\n\nPress any key to close";
+    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  s       Edit browser search query\n  p       Cycle browser search platform\n  o       Open current search in browser\n  d       Start/continue queue\n  c       Cancel active download\n  b       Cycle browser cookie source\n  r       Toggle aria2 for direct files\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nConnections: 4–8 is usually practical. Above 8 may increase throttling or HTTP 403 risk.\n\nPress any key to close";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::bordered().title(" Help "))

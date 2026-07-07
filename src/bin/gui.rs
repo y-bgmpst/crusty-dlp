@@ -13,6 +13,7 @@ use crusty_dlp::{
         supports_playlist_expansion, validate_output_template, validate_rate_limit, DownloadEvent,
         DownloadOptions, Downloader,
     },
+    search::{open_platform_search, SearchPlatform},
 };
 use eframe::egui::{self, Color32, RichText};
 use tokio::sync::{mpsc, oneshot};
@@ -58,6 +59,7 @@ struct GuiApp {
     config: Config,
     config_path: Option<PathBuf>,
     input: String,
+    search_query: String,
     output_dir_text: String,
     output_template_text: String,
     rate_limit_text: String,
@@ -102,6 +104,7 @@ impl GuiApp {
             output_dir_text: config.output_dir.to_string_lossy().into_owned(),
             output_template_text: config.output_template.clone(),
             rate_limit_text: config.rate_limit.clone(),
+            search_query: String::new(),
             config,
             config_path,
             input: String::new(),
@@ -123,6 +126,24 @@ impl GuiApp {
             if let Err(error) = self.config.save(path) {
                 self.status = error.to_string();
             }
+        }
+    }
+
+    fn search_platform(&self) -> SearchPlatform {
+        SearchPlatform::from_config(&self.config.search_platform)
+    }
+
+    fn set_search_platform(&mut self, platform: SearchPlatform) {
+        self.config.search_platform = platform.config_value().into();
+        self.save_config();
+    }
+
+    fn open_search(&mut self) {
+        match open_platform_search(&self.search_query, self.search_platform()) {
+            Ok(url) => {
+                self.status = format!("Opened {} search: {url}", self.search_platform().label())
+            }
+            Err(error) => self.status = error.to_string(),
         }
     }
 
@@ -240,6 +261,18 @@ impl GuiApp {
         self.fill_slots();
     }
 
+    fn pause_queue(&mut self) {
+        self.queue_running = false;
+        if self.active_downloads.is_empty() {
+            self.status = "Queue paused".into();
+        } else {
+            self.status = format!(
+                "Queue paused, letting {} active download(s) finish",
+                self.active_downloads.len()
+            );
+        }
+    }
+
     fn fill_slots(&mut self) {
         let max_active = usize::from(self.config.max_active_downloads.clamp(1, 8));
         while self.queue_running && self.active_downloads.len() < max_active {
@@ -349,6 +382,40 @@ impl GuiApp {
         self.status = "Cancelling active downloads…".into();
     }
 
+    fn restart_failed_or_cancelled(&mut self) {
+        let mut restarted = 0usize;
+        for item in &mut self.queue {
+            if matches!(item.state, DownloadState::Failed | DownloadState::Cancelled) {
+                item.state = DownloadState::Waiting;
+                item.progress = 0.0;
+                item.progress_text.clear();
+                item.error = None;
+                restarted += 1;
+            }
+        }
+
+        if restarted == 0 {
+            self.status = "No failed or cancelled items to restart".into();
+            return;
+        }
+
+        self.status = format!("Restarted {restarted} item(s)");
+        self.log(format!("Restarted {restarted} failed/cancelled item(s)"));
+        self.start_queue();
+    }
+
+    fn has_restartable_items(&self) -> bool {
+        self.queue
+            .iter()
+            .any(|item| matches!(item.state, DownloadState::Failed | DownloadState::Cancelled))
+    }
+
+    fn has_waiting_items(&self) -> bool {
+        self.queue
+            .iter()
+            .any(|item| item.state == DownloadState::Waiting)
+    }
+
     fn process_events(&mut self) {
         while let Ok(job) = self.event_rx.try_recv() {
             if job.index >= self.queue.len() {
@@ -445,6 +512,42 @@ impl GuiApp {
                 .clicked()
             {
                 self.add_input();
+            }
+        });
+
+        ui.add_space(14.0);
+        section_frame(ui, "Search in browser", |ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.search_query)
+                    .hint_text("Search query")
+                    .desired_width(f32::INFINITY),
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.open_search();
+            }
+            ui.add_space(8.0);
+            egui::ComboBox::from_id_salt("search-platform")
+                .selected_text(self.search_platform().label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for platform in SearchPlatform::ALL {
+                        if ui
+                            .selectable_label(self.search_platform() == platform, platform.label())
+                            .clicked()
+                        {
+                            self.set_search_platform(platform);
+                        }
+                    }
+                });
+            ui.add_space(8.0);
+            if ui
+                .add_sized(
+                    [ui.available_width(), 34.0],
+                    egui::Button::new(RichText::new("Open search in browser").strong()),
+                )
+                .clicked()
+            {
+                self.open_search();
             }
         });
 
@@ -708,15 +811,53 @@ impl GuiApp {
 
     fn queue_panel(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, &format!("Queue ({})", self.queue.len()), |ui| {
+            let full_width = ui.available_width();
+            let number_width = 22.0;
+            let thumb_width = 84.0;
+            let status_width = 112.0;
+            let progress_width = 170.0;
+            let gap = 12.0;
+            let info_width = (full_width
+                - number_width
+                - thumb_width
+                - status_width
+                - progress_width
+                - gap * 4.0)
+                .max(180.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("#").strong().color(Color32::GRAY));
-                ui.add_space(12.0);
-                ui.label(RichText::new("Item").strong().color(Color32::GRAY));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("Progress").strong().color(Color32::GRAY));
-                    ui.add_space(70.0);
-                    ui.label(RichText::new("Status").strong().color(Color32::GRAY));
-                });
+                ui.allocate_ui_with_layout(
+                    egui::vec2(number_width, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(RichText::new("#").strong().color(Color32::GRAY));
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(thumb_width, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |_| {},
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(info_width, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(RichText::new("Item").strong().color(Color32::GRAY));
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(status_width, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(RichText::new("Status").strong().color(Color32::GRAY));
+                    },
+                );
+                ui.allocate_ui_with_layout(
+                    egui::vec2(progress_width, 20.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.label(RichText::new("Progress").strong().color(Color32::GRAY));
+                    },
+                );
             });
             ui.separator();
             egui::ScrollArea::vertical()
@@ -770,8 +911,18 @@ impl GuiApp {
                         ui.horizontal(|ui| {
                             thumbnail_placeholder(ui, item);
                             ui.vertical(|ui| {
-                                ui.label(RichText::new(short_url(&item.url)).strong().size(18.0));
-                                ui.small(&item.url);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(short_url(&item.url)).strong().size(18.0),
+                                    )
+                                    .truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&item.url).size(12.0).color(Color32::GRAY),
+                                    )
+                                    .truncate(),
+                                );
                                 ui.add_space(8.0);
                                 ui.add(
                                     egui::ProgressBar::new(item.progress)
@@ -789,23 +940,64 @@ impl GuiApp {
                 }
 
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    let start = ui.add_sized(
-                        [ui.available_width() * 0.65, 40.0],
-                        egui::Button::new(RichText::new("Start queue").strong()).fill(BLUE),
-                    );
-                    if start.clicked() {
-                        self.start_queue();
-                    }
-                    if ui
-                        .add_sized(
-                            [ui.available_width(), 40.0],
-                            egui::Button::new("Cancel active"),
-                        )
-                        .clicked()
-                    {
-                        self.cancel();
-                    }
+                let has_waiting = self.has_waiting_items();
+                let has_active = !self.active_downloads.is_empty();
+                let has_restartable = self.has_restartable_items();
+
+                egui::Grid::new("queue_controls")
+                    .num_columns(2)
+                    .spacing([12.0, 12.0])
+                    .show(ui, |ui| {
+                        if ui
+                            .add_sized(
+                                [ui.available_width(), 40.0],
+                                egui::Button::new(RichText::new("Start / Resume").strong())
+                                    .fill(BLUE),
+                            )
+                            .clicked()
+                        {
+                            self.start_queue();
+                        }
+
+                        if ui
+                            .add_enabled(
+                                self.queue_running || has_active,
+                                egui::Button::new("Pause queue"),
+                            )
+                            .clicked()
+                        {
+                            self.pause_queue();
+                        }
+                        ui.end_row();
+
+                        if ui
+                            .add_enabled(
+                                has_active,
+                                egui::Button::new(RichText::new("Stop active").color(RED)),
+                            )
+                            .clicked()
+                        {
+                            self.cancel();
+                        }
+
+                        if ui
+                            .add_enabled(has_restartable, egui::Button::new("Restart failed"))
+                            .clicked()
+                        {
+                            self.restart_failed_or_cancelled();
+                        }
+                        ui.end_row();
+                    });
+
+                ui.add_space(4.0);
+                ui.small(if self.queue_running {
+                    "Queue is running. New waiting items will start until the active limit is reached."
+                } else if has_active {
+                    "Queue dispatch is paused. Active downloads keep running until they finish or you stop them."
+                } else if has_waiting {
+                    "Queue is idle. Press Start / Resume to launch waiting items."
+                } else {
+                    "No waiting items. Add URLs or restart failed entries."
                 });
             },
         );
@@ -835,15 +1027,18 @@ impl eframe::App for GuiApp {
             ui.horizontal(|ui| {
                 ui.heading(RichText::new("crusty-dlp").strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(&self.status);
+                    ui.add(
+                        egui::Label::new(RichText::new(&self.status).color(Color32::LIGHT_GRAY))
+                            .truncate(),
+                    );
                 });
             });
         });
         egui::SidePanel::left("settings")
             .resizable(false)
-            .default_width(380.0)
-            .min_width(380.0)
-            .max_width(380.0)
+            .default_width(392.0)
+            .min_width(352.0)
+            .max_width(420.0)
             .show(ctx, |ui| {
                 egui::Frame::new()
                     .inner_margin(egui::Margin::same(12))
@@ -966,37 +1161,89 @@ fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
         .stroke(egui::Stroke::new(1.0, Color32::from_gray(54)))
         .corner_radius(10.0)
         .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(format!("{}", index + 1)).strong());
+            let full_width = ui.available_width();
+            let number_width = 22.0;
+            let thumb_width = 84.0;
+            let status_width = 112.0;
+            let progress_width = 170.0;
+            let gap = 12.0;
+            let info_width = (full_width
+                - number_width
+                - thumb_width
+                - status_width
+                - progress_width
+                - gap * 4.0)
+                .max(180.0);
+
+            ui.horizontal_top(|ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(number_width, 52.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.label(RichText::new(format!("{}", index + 1)).strong());
+                    },
+                );
+
                 thumbnail_placeholder(ui, item);
-                ui.vertical(|ui| {
-                    ui.label(RichText::new(short_url(&item.url)).strong());
-                    ui.small(&item.url);
-                    if let Some(error) = &item.error {
-                        ui.add_space(4.0);
-                        ui.label(RichText::new(error).color(RED));
-                    }
-                });
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if matches!(
-                        item.state,
-                        DownloadState::Downloading | DownloadState::Finished
-                    ) {
-                        ui.vertical(|ui| {
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(info_width, 64.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(RichText::new(short_url(&item.url)).strong())
+                                .truncate(),
+                        );
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(&item.url).size(12.0).color(Color32::GRAY),
+                            )
+                            .truncate(),
+                        );
+                        if let Some(error) = &item.error {
+                            ui.add_space(4.0);
+                            ui.add(
+                                egui::Label::new(RichText::new(error).color(RED).size(12.5))
+                                    .truncate(),
+                            );
+                        }
+                    },
+                );
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(status_width, 56.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| status_badge(ui, item.state),
+                );
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(progress_width, 56.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        if matches!(
+                            item.state,
+                            DownloadState::Downloading | DownloadState::Finished
+                        ) {
                             ui.add(
                                 egui::ProgressBar::new(item.progress)
-                                    .desired_width(150.0)
+                                    .desired_width(progress_width - 8.0)
                                     .show_percentage(),
                             );
                             if !item.progress_text.is_empty() {
-                                ui.small(&item.progress_text);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&item.progress_text)
+                                            .size(12.0)
+                                            .color(Color32::GRAY),
+                                    )
+                                    .truncate(),
+                                );
                             }
-                        });
-                    } else {
-                        ui.add_space(150.0);
-                    }
-                    status_badge(ui, item.state);
-                });
+                        } else {
+                            ui.add_space(22.0);
+                        }
+                    },
+                );
             });
         });
 }

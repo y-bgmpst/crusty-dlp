@@ -128,6 +128,9 @@ Run `crusty-dlp --help` for CLI details.
 | --- | --- |
 | `q` | Quit and cancel the active child safely |
 | `a` | Add one or more whitespace-separated URLs |
+| `s` | Edit the browser-search query |
+| `p` | Cycle the browser-search platform |
+| `o` | Open the current search in your default browser |
 | `d` | Start or continue the queue |
 | `c` | Cancel the active download |
 | `b` | Cycle the browser used for session cookies |
@@ -214,7 +217,12 @@ use_aria2 = false
 rate_limit = ""
 max_active_downloads = 1
 allow_playlists = false
+search_platform = "youtube"
 ```
+
+The browser-search launcher opens the selected platform's normal search page in
+your default browser. It does not scrape or embed site search results inside
+crusty-dlp.
 
 ## Troubleshooting
 

@@ -44,9 +44,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             app.panel = Panel::Url;
             app.editing = true;
         }
+        KeyCode::Char('s') => {
+            app.panel = Panel::Search;
+            app.input = app.search_query.clone();
+            app.editing = true;
+        }
         KeyCode::Char('d') => app.request_start(),
         KeyCode::Char('c') => app.cancel(),
         KeyCode::Char('b') => app.cycle_cookies_browser(),
+        KeyCode::Char('p') => app.cycle_search_platform(),
+        KeyCode::Char('o') => app.open_search(),
         KeyCode::Char('r') => app.toggle_aria2(),
         KeyCode::Char('?') => app.show_help = true,
         KeyCode::Tab => app.cycle_panel(),
