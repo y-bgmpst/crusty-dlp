@@ -44,7 +44,12 @@ To install for the current user:
 ```console
 install -Dm755 target/release/crusty-dlp ~/.local/bin/crusty-dlp
 install -Dm755 target/release/crusty-dlp-gui ~/.local/bin/crusty-dlp-gui
+install -Dm644 assets/crusty-dlp.desktop ~/.local/share/applications/crusty-dlp.desktop
+install -Dm644 assets/crusty-dlp.svg ~/.local/share/icons/hicolor/scalable/apps/crusty-dlp.svg
+update-desktop-database ~/.local/share/applications
 ```
+
+After that, `crusty-dlp` appears in the desktop launcher as a normal GUI app.
 
 Both bash and fish can run the resulting binary; no shell-specific integration
 is required. The included `PKGBUILD` is a draft for release packaging. Replace

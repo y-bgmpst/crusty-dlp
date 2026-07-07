@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-label="crusty-dlp icon">
+  <defs>
+    <linearGradient id="bg" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#1f2429"/>
+      <stop offset="100%" stop-color="#12161b"/>
+    </linearGradient>
+    <linearGradient id="shell" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0%" stop-color="#ff8a3d"/>
+      <stop offset="100%" stop-color="#e35d24"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#bg)"/>
+  <path d="M75 89c0-29 24-53 53-53s53 24 53 53v43c0 29-24 53-53 53s-53-24-53-53V89Z" fill="url(#shell)"/>
+  <path d="M92 96c0-20 16-36 36-36s36 16 36 36v29c0 20-16 36-36 36s-36-16-36-36V96Z" fill="#1b2026"/>
+  <circle cx="103" cy="108" r="8" fill="#ffd2b3"/>
+  <circle cx="153" cy="108" r="8" fill="#ffd2b3"/>
+  <path d="M122 104l26 15-26 15z" fill="#4aa3ff"/>
+  <path d="M51 120c-11-9-18-22-18-37 0-4 3-7 7-7s7 3 7 7c0 16 13 29 29 29h6c4 0 7 3 7 7s-3 7-7 7h-6c-9 0-17-2-25-6Z" fill="#ff8a3d"/>
+  <path d="M205 120c11-9 18-22 18-37 0-4-3-7-7-7s-7 3-7 7c0 16-13 29-29 29h-6c-4 0-7 3-7 7s3 7 7 7h6c9 0 17-2 25-6Z" fill="#ff8a3d"/>
+  <path d="M75 173c-13 0-24 10-24 24 0 4 3 7 7 7s7-3 7-7c0-6 5-10 10-10h22c4 0 7-3 7-7s-3-7-7-7H75Z" fill="#ff8a3d"/>
+  <path d="M181 173c13 0 24 10 24 24 0 4-3 7-7 7s-7-3-7-7c0-6-5-10-10-10h-22c-4 0-7-3-7-7s3-7 7-7h22Z" fill="#ff8a3d"/>
+  <rect x="98" y="182" width="60" height="18" rx="9" fill="#2f80ed"/>
+</svg>
