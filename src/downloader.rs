@@ -326,7 +326,7 @@ pub fn expand_playlist_urls(
     }
 
     if is_pmvhaven_playlist_url(url) {
-        return expand_pmvhaven_playlist_urls(url);
+        return expand_pmvhaven_playlist_urls(executable, url);
     }
 
     let mut command = StdCommand::new(executable);
@@ -370,27 +370,61 @@ fn playlist_probe_arguments() -> [&'static str; 4] {
     ]
 }
 
-fn expand_pmvhaven_playlist_urls(url: &str) -> Result<Option<Vec<PlaylistEntry>>, String> {
-    let output = StdCommand::new("curl")
-        .args(["-fsSL", "--"])
-        .arg(url)
+fn expand_pmvhaven_playlist_urls(
+    executable: &Path,
+    url: &str,
+) -> Result<Option<Vec<PlaylistEntry>>, String> {
+    let canonical_url = canonical_pmvhaven_playlist_url(url);
+    let mut command = StdCommand::new(executable);
+    command.args(playlist_probe_arguments());
+    if let Some(plugin_dir) = plugin_directory() {
+        command.arg("--plugin-dirs").arg(plugin_dir);
+    }
+    let output = command
+        .arg(&canonical_url)
         .output()
         .map_err(|error| format!("could not inspect PMVHaven playlist: {error}"))?;
-    if !output.status.success() {
+    let mut yt_dlp_error = None;
+    let mut entries = if output.status.success() {
+        dedupe_playlist_entries(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| parse_flat_playlist_line(line, PlaylistSource::PmvHaven))
+                .collect::<Vec<_>>(),
+        )
+    } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let message = stderr
-            .lines()
-            .rev()
-            .find(|line| !line.trim().is_empty())
-            .unwrap_or("curl could not inspect the PMVHaven playlist");
-        return Err(message.to_owned());
-    }
+        yt_dlp_error = Some(
+            stderr
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("yt-dlp could not inspect the PMVHaven playlist")
+                .to_owned(),
+        );
+        Vec::new()
+    };
 
-    let html = String::from_utf8_lossy(&output.stdout);
-    let entries = dedupe_playlist_entries(parse_pmvhaven_itemlist_entries(&html));
     if entries.is_empty() {
+        let output = StdCommand::new("curl")
+            .args(["-fsSL", "--"])
+            .arg(&canonical_url)
+            .output()
+            .map_err(|error| format!("could not inspect PMVHaven playlist HTML: {error}"))?;
+        if output.status.success() {
+            let html = String::from_utf8_lossy(&output.stdout);
+            entries = dedupe_playlist_entries(parse_pmvhaven_itemlist_entries(&html));
+            if entries.is_empty() {
+                entries = dedupe_playlist_entries(parse_pmvhaven_href_entries(&html));
+            }
+        }
+    }
+    if entries.is_empty() {
+        if let Some(message) = yt_dlp_error {
+            return Err(message);
+        }
         return Err(format!(
-            "PMVHaven playlist parser found 0 entries for {url}"
+            "PMVHaven playlist parser found 0 entries for {canonical_url}"
         ));
     }
     Ok(Some(entries))
@@ -398,31 +432,57 @@ fn expand_pmvhaven_playlist_urls(url: &str) -> Result<Option<Vec<PlaylistEntry>>
 
 fn parse_pmvhaven_itemlist_entries(html: &str) -> Vec<PlaylistEntry> {
     let mut entries = Vec::new();
-    let name_key = r#""name":"#;
-    let embed_key = r#""embedUrl":"#;
-    let Some(list_start) = html.find(r#""itemListElement""#) else {
-        return entries;
-    };
-    let mut cursor = &html[list_start..];
+    let mut cursor = html;
+    let name_key = "\"name\":\"";
+    let embed_key = "embedUrl\":\"";
 
     while let Some((before_embed, after_embed)) = cursor.split_once(embed_key) {
         let Some((embed_url_raw, rest)) = after_embed.split_once('"') else {
             break;
         };
-        let title = before_embed
-            .rsplit(name_key)
-            .next()
-            .and_then(|fragment| fragment.split_once('"').map(|(value, _)| value.to_owned()));
-        let embed_url = decode_json_escapes(&embed_url_raw);
+        let embed_url = decode_json_escapes(embed_url_raw);
         if embed_url.starts_with("http://") || embed_url.starts_with("https://") {
+            let title = before_embed
+                .rsplit(name_key)
+                .next()
+                .and_then(|fragment| fragment.split_once('"').map(|(value, _)| value))
+                .map(decode_json_escapes)
+                .filter(|value| !value.trim().is_empty());
             entries.push(PlaylistEntry {
-                title: title.map(|value| decode_json_escapes(&value)),
+                title,
                 url: embed_url,
             });
         }
         cursor = rest;
     }
     entries
+}
+
+fn parse_pmvhaven_href_entries(html: &str) -> Vec<PlaylistEntry> {
+    let mut entries = Vec::new();
+    let mut cursor = html;
+    let href_key = r#"href="/video/"#;
+    while let Some((_, after_href)) = cursor.split_once(href_key) {
+        let Some((slug, rest)) = after_href.split_once('"') else {
+            break;
+        };
+        if !slug.trim().is_empty() {
+            entries.push(PlaylistEntry {
+                title: None,
+                url: format!("https://pmvhaven.com/video/{slug}"),
+            });
+        }
+        cursor = rest;
+    }
+    entries
+}
+
+fn canonical_pmvhaven_playlist_url(url: &str) -> String {
+    let trimmed = url.trim();
+    match trimmed.find(['?', '#']) {
+        Some(index) => trimmed[..index].to_owned(),
+        None => trimmed.to_owned(),
+    }
 }
 
 fn decode_json_escapes(value: &str) -> String {
@@ -563,7 +623,11 @@ fn url_host_matches(value: &str, expected: &str) -> bool {
 
 fn parse_flat_playlist_line(line: &str, source: PlaylistSource) -> Option<PlaylistEntry> {
     let mut fields = line.splitn(4, '\t');
-    let title = fields.next().and_then(non_empty_trimmed).map(str::to_owned);
+    let title = fields
+        .next()
+        .and_then(non_empty_trimmed)
+        .filter(|value| !value.eq_ignore_ascii_case("na"))
+        .map(str::to_owned);
     let id = fields.next().and_then(non_empty_trimmed);
     let webpage_url = fields.next().and_then(non_empty_trimmed);
     let media_url = fields.next().and_then(non_empty_trimmed);
@@ -861,6 +925,66 @@ mod tests {
                 "--print",
                 "%(title)s\t%(id)s\t%(webpage_url)s\t%(url)s",
                 "--"
+            ]
+        );
+    }
+
+    #[test]
+    fn strips_pmvhaven_playlist_query_params() {
+        assert_eq!(
+            canonical_pmvhaven_playlist_url(
+                "https://pmvhaven.com/playlists/692b70e2d7984d93b13f83c2?index=8"
+            ),
+            "https://pmvhaven.com/playlists/692b70e2d7984d93b13f83c2"
+        );
+        assert_eq!(
+            canonical_pmvhaven_playlist_url(
+                "https://pmvhaven.com/playlists/692b70e2d7984d93b13f83c2#foo"
+            ),
+            "https://pmvhaven.com/playlists/692b70e2d7984d93b13f83c2"
+        );
+    }
+
+    #[test]
+    fn parses_pmvhaven_href_fallback_entries() {
+        let html = r#"
+            <a href="/video/bimbo-candy-1_656b815db380dff74beb2d65">one</a>
+            <a href="/video/another-one_123">two</a>
+        "#;
+        assert_eq!(
+            parse_pmvhaven_href_entries(html),
+            vec![
+                PlaylistEntry {
+                    title: None,
+                    url: "https://pmvhaven.com/video/bimbo-candy-1_656b815db380dff74beb2d65".into(),
+                },
+                PlaylistEntry {
+                    title: None,
+                    url: "https://pmvhaven.com/video/another-one_123".into(),
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_pmvhaven_embed_entries() {
+        let html = r#"
+            <script type="application/ld+json">{"@type":"ItemList","itemListElement":[
+                {"item":{"@type":"VideoObject","name":"Bambi TikTok 7","embedUrl":"https://pmvhaven.com/videos/68f6982abdaea7d82ecae26f"}},
+                {"item":{"@type":"VideoObject","name":"Best friend","embedUrl":"https://pmvhaven.com/videos/68f69f02bdaea7d82ecb0064"}}
+            ]}</script>
+        "#;
+        assert_eq!(
+            parse_pmvhaven_itemlist_entries(html),
+            vec![
+                PlaylistEntry {
+                    title: Some("Bambi TikTok 7".into()),
+                    url: "https://pmvhaven.com/videos/68f6982abdaea7d82ecae26f".into(),
+                },
+                PlaylistEntry {
+                    title: Some("Best friend".into()),
+                    url: "https://pmvhaven.com/videos/68f69f02bdaea7d82ecb0064".into(),
+                }
             ]
         );
     }

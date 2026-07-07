@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "Safe terminal and desktop interfaces for yt-dlp"
 repository = "https://github.com/y-bgmpst/crusty-dlp"
+build = "build.rs"
 
 [dependencies]
 anyhow = "1.0"

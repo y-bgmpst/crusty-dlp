@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{HashMap, VecDeque},
     path::PathBuf,
     sync::mpsc::{self as std_mpsc, Receiver, TryRecvError},
@@ -27,6 +28,18 @@ const AMBER: Color32 = Color32::from_rgb(217, 154, 34);
 const PANEL: Color32 = Color32::from_rgb(31, 36, 41);
 const PANEL_ALT: Color32 = Color32::from_rgb(36, 42, 48);
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_GIT_SHA: &str = match option_env!("CRUSTY_GIT_SHA") {
+    Some(value) => value,
+    None => "unknown",
+};
+const BUILD_GIT_DIRTY: &str = match option_env!("CRUSTY_GIT_DIRTY") {
+    Some(value) => value,
+    None => "unknown",
+};
+const BUILD_TIMESTAMP: &str = match option_env!("CRUSTY_BUILD_TIMESTAMP") {
+    Some(value) => value,
+    None => "unknown",
+};
 const BUILD_PROFILE: &str = if cfg!(debug_assertions) {
     "debug"
 } else {
@@ -47,6 +60,15 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
     )
+}
+
+fn build_label() -> String {
+    let dirty_suffix = if BUILD_GIT_DIRTY == "dirty" {
+        "-dirty"
+    } else {
+        ""
+    };
+    format!("v{APP_VERSION}+{BUILD_GIT_SHA}{dirty_suffix}")
 }
 
 #[derive(Debug)]
@@ -204,14 +226,21 @@ impl GuiApp {
 
     fn expand_or_enqueue(&mut self, url: &str) -> Result<usize, String> {
         validate_url(url).map_err(|error| error.to_string())?;
-        if self.config.allow_playlists && supports_playlist_expansion(url) {
+        let supports_playlists = supports_playlist_expansion(url);
+        if supports_playlists && !self.config.allow_playlists {
+            return Err(
+                "Allow playlists is disabled. Enable it in Advanced yt-dlp options before adding supported playlist URLs."
+                    .into(),
+            );
+        }
+        if self.config.allow_playlists && supports_playlists {
             let yt_dlp = dependency_path("yt-dlp").ok_or_else(|| {
                 "yt-dlp was not found in PATH or beside the application".to_owned()
             })?;
             match expand_playlist_urls(&yt_dlp, url) {
                 Ok(Some(entries)) => {
                     self.log(format!(
-                        "Playlist expansion found {} item(s): {url}",
+                        "Expanded playlist into {} item(s): {url}",
                         entries.len()
                     ));
                     for entry in &entries {
@@ -236,15 +265,17 @@ impl GuiApp {
     }
 
     fn enqueue_url(&mut self, url: &str) {
-        self.enqueue_queue_item(None, url);
+        self.enqueue_queue_item(None, url, true);
     }
 
     fn enqueue_playlist_entry(&mut self, entry: &PlaylistEntry) {
-        self.enqueue_queue_item(entry.title.clone(), &entry.url);
+        self.enqueue_queue_item(entry.title.clone(), &entry.url, false);
     }
 
-    fn enqueue_queue_item(&mut self, title: Option<String>, url: &str) {
-        self.log(format!("Added to queue: {url}"));
+    fn enqueue_queue_item(&mut self, title: Option<String>, url: &str, log_add: bool) {
+        if log_add {
+            self.log(format!("Added to queue: {url}"));
+        }
         self.queue.push(GuiQueueItem {
             title,
             url: url.to_owned(),
@@ -541,10 +572,11 @@ impl GuiApp {
         section_frame(ui, "URL", |ui| {
             let response = ui
                 .horizontal(|ui| {
-                    let response = ui.add(
-                        egui::TextEdit::singleline(&mut self.input)
-                            .hint_text("https://example.com/video")
-                            .desired_width((ui.available_width() - 78.0).max(120.0)),
+                    let response = text_edit_with_context_menu(
+                        ui,
+                        &mut self.input,
+                        "https://example.com/video",
+                        (ui.available_width() - 78.0).max(120.0),
                     );
                     if ui.button("Paste").clicked() {
                         self.paste_input_from_clipboard();
@@ -569,10 +601,11 @@ impl GuiApp {
 
         ui.add_space(14.0);
         section_frame(ui, "Search in browser", |ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.search_query)
-                    .hint_text("Search query")
-                    .desired_width(f32::INFINITY),
+            let response = text_edit_with_context_menu(
+                ui,
+                &mut self.search_query,
+                "Search query",
+                f32::INFINITY,
             );
             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 self.open_search();
@@ -629,13 +662,13 @@ impl GuiApp {
                 });
             if matches!(self.mode, DownloadMode::Custom(_)) {
                 ui.add_space(8.0);
-                if ui
-                    .add(
-                        egui::TextEdit::singleline(&mut self.config.custom_format)
-                            .hint_text("yt-dlp format selector")
-                            .desired_width(f32::INFINITY),
-                    )
-                    .changed()
+                if text_edit_with_context_menu(
+                    ui,
+                    &mut self.config.custom_format,
+                    "yt-dlp format selector",
+                    f32::INFINITY,
+                )
+                .changed()
                 {
                     self.save_config();
                 }
@@ -655,10 +688,11 @@ impl GuiApp {
 
         ui.add_space(14.0);
         section_frame(ui, "Output folder", |ui| {
-            let folder_response = ui.add(
-                egui::TextEdit::singleline(&mut self.output_dir_text)
-                    .hint_text("/home/user/Downloads")
-                    .desired_width(f32::INFINITY),
+            let folder_response = text_edit_with_context_menu(
+                ui,
+                &mut self.output_dir_text,
+                "/home/user/Downloads",
+                f32::INFINITY,
             );
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -785,10 +819,11 @@ impl GuiApp {
 
     fn advanced_settings_panel(&mut self, ui: &mut egui::Ui) {
         ui.label(RichText::new("Filename template").strong());
-        let template_response = ui.add(
-            egui::TextEdit::singleline(&mut self.output_template_text)
-                .hint_text("%(title)s [%(id)s].%(ext)s")
-                .desired_width(f32::INFINITY),
+        let template_response = text_edit_with_context_menu(
+            ui,
+            &mut self.output_template_text,
+            "%(title)s [%(id)s].%(ext)s",
+            f32::INFINITY,
         );
         if template_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
             self.apply_output_template();
@@ -842,14 +877,17 @@ impl GuiApp {
         {
             self.save_config();
         }
-        ui.small("Disabled by default. Supported playlist URLs are expanded into queue entries before downloading.");
+        ui.small(
+            "Enabled by default. Supported playlist URLs are expanded into queue entries before downloading.",
+        );
 
         ui.horizontal(|ui| {
             ui.label("Speed limit");
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.rate_limit_text)
-                    .hint_text("blank = unlimited, e.g. 5M")
-                    .desired_width(170.0),
+            let response = text_edit_with_context_menu(
+                ui,
+                &mut self.rate_limit_text,
+                "blank = unlimited, e.g. 5M",
+                170.0,
             );
             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 self.apply_rate_limit();
@@ -1082,7 +1120,14 @@ impl eframe::App for GuiApp {
         self.process_events();
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(RichText::new(format!("crusty-dlp v{APP_VERSION}")).strong());
+                ui.heading(
+                    RichText::new(format!(
+                        "crusty-dlp {} · built {}",
+                        build_label(),
+                        BUILD_TIMESTAMP
+                    ))
+                    .strong(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add(
                         egui::Label::new(RichText::new(&self.status).color(Color32::LIGHT_GRAY))
@@ -1135,7 +1180,18 @@ impl eframe::App for GuiApp {
                         .unwrap_or_else(|| "not found".into());
                     ui.label(format!("yt-dlp: {yt_dlp}"));
                     ui.separator();
-                    ui.label(format!("crusty-dlp v{APP_VERSION} ({BUILD_PROFILE})"));
+                    ui.label(format!("crusty-dlp {} ({BUILD_PROFILE})", build_label()));
+                    ui.separator();
+                    ui.label(format!("built: {BUILD_TIMESTAMP}"));
+                    ui.separator();
+                    ui.label(format!(
+                        "playlists: {}",
+                        if self.config.allow_playlists {
+                            "on"
+                        } else {
+                            "off"
+                        }
+                    ));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let waiting = self
                             .queue
@@ -1236,6 +1292,43 @@ fn section_frame(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut 
             ui.add_space(10.0);
             add_contents(ui);
         });
+}
+
+fn text_edit_with_context_menu(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint_text: &str,
+    desired_width: f32,
+) -> egui::Response {
+    let response = ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint_text)
+            .desired_width(desired_width),
+    );
+    response.context_menu(|ui| {
+        if ui.button("Copy").clicked() {
+            ui.ctx().copy_text(value.clone());
+            ui.close_menu();
+        }
+        if ui.button("Cut").clicked() {
+            ui.ctx().copy_text(value.clone());
+            value.clear();
+            ui.close_menu();
+        }
+        if ui.button("Paste").clicked() {
+            if let Ok(mut clipboard) = Clipboard::new() {
+                if let Ok(text) = clipboard.get_text() {
+                    *value = text;
+                }
+            }
+            ui.close_menu();
+        }
+        if ui.button("Clear").clicked() {
+            value.clear();
+            ui.close_menu();
+        }
+    });
+    response
 }
 
 fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
@@ -1414,9 +1507,47 @@ fn short_url(url: &str) -> &str {
         .unwrap_or(url)
 }
 
-fn queue_item_title(item: &GuiQueueItem) -> &str {
+fn queue_item_title(item: &GuiQueueItem) -> Cow<'_, str> {
     item.title
         .as_deref()
         .filter(|title| !title.trim().is_empty())
-        .unwrap_or_else(|| short_url(&item.url))
+        .map(Cow::Borrowed)
+        .unwrap_or_else(|| pretty_title_from_url(&item.url))
+}
+
+fn pretty_title_from_url(url: &str) -> Cow<'_, str> {
+    let trimmed = short_url(url);
+    let slug = trimmed
+        .split('/')
+        .next_back()
+        .unwrap_or(trimmed)
+        .split('?')
+        .next()
+        .unwrap_or(trimmed)
+        .split('#')
+        .next()
+        .unwrap_or(trimmed)
+        .trim();
+
+    if slug.is_empty() {
+        return Cow::Borrowed(trimmed);
+    }
+
+    let display = slug
+        .rsplit_once('_')
+        .map(|(prefix, suffix)| {
+            if suffix.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                prefix
+            } else {
+                slug
+            }
+        })
+        .unwrap_or(slug)
+        .replace(['-', '_', '+'], " ");
+
+    if display.trim().is_empty() {
+        Cow::Borrowed(trimmed)
+    } else {
+        Cow::Owned(display)
+    }
 }
