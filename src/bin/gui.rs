@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     path::PathBuf,
+    sync::mpsc::{self as std_mpsc, Receiver, TryRecvError},
     time::Duration,
 };
 
@@ -66,6 +67,7 @@ struct GuiApp {
     impersonation_targets: Vec<String>,
     logs: VecDeque<String>,
     status: String,
+    folder_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
 }
 
 impl GuiApp {
@@ -109,6 +111,7 @@ impl GuiApp {
             impersonation_targets,
             logs: VecDeque::new(),
             status,
+            folder_picker_rx: None,
         }
     }
 
@@ -388,6 +391,35 @@ impl GuiApp {
         {
             self.status = "Queue idle".into();
         }
+
+        self.poll_folder_picker();
+    }
+
+    fn poll_folder_picker(&mut self) {
+        let Some(receiver) = self.folder_picker_rx.take() else {
+            return;
+        };
+
+        match receiver.try_recv() {
+            Ok(Ok(Some(path))) => {
+                self.config.output_dir = path.clone();
+                self.output_dir_text = path.display().to_string();
+                self.save_config();
+                self.status = format!("Selected output folder: {}", path.display());
+            }
+            Ok(Ok(None)) => {
+                self.status = "Folder selection cancelled".into();
+            }
+            Ok(Err(error)) => {
+                self.status = error;
+            }
+            Err(TryRecvError::Empty) => {
+                self.folder_picker_rx = Some(receiver);
+            }
+            Err(TryRecvError::Disconnected) => {
+                self.status = "Folder picker closed unexpectedly".into();
+            }
+        }
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
@@ -461,12 +493,19 @@ impl GuiApp {
             if ui.button("Use typed path").clicked() {
                 self.apply_output_dir();
             }
-            if ui.button("Browse...").clicked() {
-                if let Some(path) = self.browse_output_dir() {
-                    self.config.output_dir = path.clone();
-                    self.output_dir_text = path.display().to_string();
-                    self.save_config();
-                }
+            let browse_label = if self.folder_picker_rx.is_some() {
+                "Browse… (opening)"
+            } else {
+                "Browse..."
+            };
+            if ui
+                .add_enabled(
+                    self.folder_picker_rx.is_none(),
+                    egui::Button::new(browse_label),
+                )
+                .clicked()
+            {
+                self.browse_output_dir();
             }
         });
         if folder_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
@@ -533,21 +572,34 @@ impl GuiApp {
             .show(ui, |ui| self.advanced_settings_panel(ui));
     }
 
-    fn browse_output_dir(&mut self) -> Option<PathBuf> {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                self.status = format!("Could not start folder picker runtime: {error}");
-                return None;
-            }
-        };
-        let _guard = runtime.enter();
-        rfd::FileDialog::new()
-            .set_directory(&self.config.output_dir)
-            .pick_folder()
+    fn browse_output_dir(&mut self) {
+        if self.folder_picker_rx.is_some() {
+            return;
+        }
+
+        let start_dir = self.config.output_dir.clone();
+        let (tx, rx) = std_mpsc::channel();
+        self.folder_picker_rx = Some(rx);
+        self.status = "Opening folder picker…".into();
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            let result = match runtime {
+                Ok(runtime) => runtime.block_on(async move {
+                    Ok::<_, String>(
+                        rfd::AsyncFileDialog::new()
+                            .set_directory(&start_dir)
+                            .pick_folder()
+                            .await
+                            .map(|handle| handle.path().to_path_buf()),
+                    )
+                }),
+                Err(error) => Err(format!("Could not start folder picker runtime: {error}")),
+            };
+            let _ = tx.send(result);
+        });
     }
 
     fn advanced_settings_panel(&mut self, ui: &mut egui::Ui) {
