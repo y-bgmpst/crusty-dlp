@@ -33,6 +33,12 @@ package() {
   install -Dm755 "target/release/$pkgname-gui" "$pkgdir/usr/bin/$pkgname-gui"
   install -Dm644 assets/crusty-dlp.desktop \
     "$pkgdir/usr/share/applications/crusty-dlp.desktop"
+  install -Dm644 assets/crusty-dlp.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/crusty-dlp.svg"
+  for size in 16 24 32 48 64 128 256 512; do
+    install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/crusty-dlp.png" \
+      "$pkgdir/usr/share/icons/hicolor/${size}x${size}/apps/crusty-dlp.png"
+  done
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 plugins/yt_dlp_plugins/extractor/boyfriendtv.py \

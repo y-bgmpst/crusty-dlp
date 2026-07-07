@@ -46,10 +46,13 @@ install -Dm755 target/release/crusty-dlp ~/.local/bin/crusty-dlp
 install -Dm755 target/release/crusty-dlp-gui ~/.local/bin/crusty-dlp-gui
 install -Dm644 assets/crusty-dlp.desktop ~/.local/share/applications/crusty-dlp.desktop
 install -Dm644 assets/crusty-dlp.svg ~/.local/share/icons/hicolor/scalable/apps/crusty-dlp.svg
+for size in 16 24 32 48 64 128 256 512; do install -Dm644 "assets/icons/hicolor/${size}x${size}/apps/crusty-dlp.png" "$HOME/.local/share/icons/hicolor/${size}x${size}/apps/crusty-dlp.png"; done
 update-desktop-database ~/.local/share/applications
 ```
 
 After that, `crusty-dlp` appears in the desktop launcher as a normal GUI app.
+If your desktop environment does not pick up the icon immediately, run
+`gtk-update-icon-cache ~/.local/share/icons/hicolor` or log out and back in.
 
 Both bash and fish can run the resulting binary; no shell-specific integration
 is required. The included `PKGBUILD` is a draft for release packaging. Replace
