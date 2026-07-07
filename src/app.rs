@@ -6,6 +6,7 @@ use crate::{
     config::Config,
     downloader::{DownloadEvent, DownloadOptions},
     errors::AppError,
+    search::{open_platform_search, SearchPlatform},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +62,7 @@ pub struct QueueItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Url,
+    Search,
     Mode,
     Impersonation,
     Connections,
@@ -75,6 +77,7 @@ pub struct App {
     pub queue: VecDeque<QueueItem>,
     pub current: Option<QueueItem>,
     pub input: String,
+    pub search_query: String,
     pub panel: Panel,
     pub editing: bool,
     pub show_help: bool,
@@ -113,6 +116,7 @@ impl App {
             queue: VecDeque::new(),
             current: None,
             input: String::new(),
+            search_query: String::new(),
             panel: Panel::Url,
             editing: false,
             show_help: false,
@@ -165,7 +169,8 @@ impl App {
 
     pub fn cycle_panel(&mut self) {
         self.panel = match self.panel {
-            Panel::Url => Panel::Mode,
+            Panel::Url => Panel::Search,
+            Panel::Search => Panel::Mode,
             Panel::Mode => Panel::Impersonation,
             Panel::Impersonation => Panel::Connections,
             Panel::Connections => Panel::Output,
@@ -195,6 +200,10 @@ impl App {
     pub fn edit_current_panel(&mut self) {
         match self.panel {
             Panel::Url => self.editing = true,
+            Panel::Search => {
+                self.input = self.search_query.clone();
+                self.editing = true;
+            }
             Panel::Output => {
                 self.input = self.config.output_dir.to_string_lossy().into();
                 self.editing = true;
@@ -213,6 +222,15 @@ impl App {
     pub fn commit_edit(&mut self) {
         match self.panel {
             Panel::Url => self.add_input(),
+            Panel::Search => {
+                if self.input.trim().is_empty() {
+                    self.message = "Search query cannot be empty".into();
+                    return;
+                }
+                self.search_query = self.input.trim().into();
+                self.editing = false;
+                self.input.clear();
+            }
             Panel::Output => {
                 if self.input.trim().is_empty() {
                     self.message = "Output folder cannot be empty".into();
@@ -237,6 +255,24 @@ impl App {
             Panel::Impersonation => {}
             Panel::Connections => {}
             Panel::Queue => {}
+        }
+    }
+
+    pub fn search_platform(&self) -> SearchPlatform {
+        SearchPlatform::from_config(&self.config.search_platform)
+    }
+
+    pub fn cycle_search_platform(&mut self) {
+        self.config.search_platform = self.search_platform().next().config_value().into();
+        self.save_config();
+    }
+
+    pub fn open_search(&mut self) {
+        match open_platform_search(&self.search_query, self.search_platform()) {
+            Ok(url) => {
+                self.message = format!("Opened {} search: {url}", self.search_platform().label())
+            }
+            Err(error) => self.message = error.to_string(),
         }
     }
 

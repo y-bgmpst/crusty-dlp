@@ -17,3 +17,5 @@ rate_limit = ""
 max_active_downloads = 1
 # Expand supported playlist URLs such as YouTube playlists.
 allow_playlists = false
+# Browser search launcher default platform.
+search_platform = "youtube"

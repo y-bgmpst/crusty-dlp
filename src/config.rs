@@ -23,6 +23,7 @@ pub struct Config {
     pub rate_limit: String,
     pub max_active_downloads: u8,
     pub allow_playlists: bool,
+    pub search_platform: String,
 }
 
 impl Default for Config {
@@ -42,6 +43,7 @@ impl Default for Config {
             rate_limit: String::new(),
             max_active_downloads: 1,
             allow_playlists: false,
+            search_platform: "youtube".into(),
         }
     }
 }
@@ -97,6 +99,7 @@ mod tests {
         assert_eq!(config.rate_limit, "");
         assert_eq!(config.max_active_downloads, 1);
         assert!(!config.allow_playlists);
+        assert_eq!(config.search_platform, "youtube");
     }
 
     #[test]
