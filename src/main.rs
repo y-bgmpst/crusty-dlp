@@ -1,22 +1,20 @@
-mod app;
-mod config;
-mod downloader;
-mod errors;
 mod input;
 mod ui;
 
 use std::io;
 
 use anyhow::{Context, Result};
-use app::App;
 use clap::Parser;
-use config::Config;
 use crossterm::{
     event::{self, Event},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use downloader::{available_impersonation_targets, dependency_path, DownloadEvent, Downloader};
+use crusty_dlp::{
+    app::App,
+    config::Config,
+    downloader::{available_impersonation_targets, dependency_path, DownloadEvent, Downloader},
+};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 

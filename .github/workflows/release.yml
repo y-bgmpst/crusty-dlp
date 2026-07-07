@@ -1,4 +1,4 @@
-name: Windows release
+name: Release
 
 on:
   workflow_dispatch:
@@ -9,51 +9,148 @@ permissions:
   contents: write
 
 jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --bins
+      - name: Package Linux bundle
+        run: |
+          set -euo pipefail
+          mkdir -p dist/bundle
+          cp target/release/crusty-dlp target/release/crusty-dlp-gui dist/bundle/
+          cp README.md COMPATIBILITY.md LICENSE dist/bundle/
+          cp -R plugins dist/bundle/plugins
+          base=https://github.com/yt-dlp/yt-dlp/releases/latest/download
+          curl -fsSLo dist/bundle/yt-dlp "$base/yt-dlp"
+          curl -fsSLo dist/SHA2-256SUMS "$base/SHA2-256SUMS"
+          expected=$(awk '$2 == "yt-dlp" { print $1 }' dist/SHA2-256SUMS)
+          actual=$(sha256sum dist/bundle/yt-dlp | awk '{ print $1 }')
+          test -n "$expected" && test "$actual" = "$expected"
+          chmod +x dist/bundle/crusty-dlp dist/bundle/crusty-dlp-gui dist/bundle/yt-dlp
+          tar -C dist/bundle -czf dist/crusty-dlp-linux-x86_64.tar.gz .
+          cd dist/bundle && zip -9r ../crusty-dlp-linux-x86_64.zip .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: |
+            dist/crusty-dlp-linux-x86_64.tar.gz
+            dist/crusty-dlp-linux-x86_64.zip
+
   windows:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build crusty-dlp
-        run: cargo build --release --locked
-
-      - name: Bundle verified yt-dlp
+      - run: cargo build --release --locked --bins
+      - name: Package Windows bundle
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force dist/bundle | Out-Null
           Copy-Item target/release/crusty-dlp.exe dist/crusty-dlp.exe
-          Copy-Item target/release/crusty-dlp.exe dist/bundle/crusty-dlp.exe
+          Copy-Item target/release/crusty-dlp-gui.exe dist/crusty-dlp-gui.exe
+          Copy-Item target/release/crusty-dlp.exe dist/bundle/
+          Copy-Item target/release/crusty-dlp-gui.exe dist/bundle/
           Copy-Item README.md, COMPATIBILITY.md, LICENSE dist/bundle/
           Copy-Item plugins dist/bundle/plugins -Recurse
-
           $base = "https://github.com/yt-dlp/yt-dlp/releases/latest/download"
           Invoke-WebRequest "$base/yt-dlp.exe" -OutFile dist/bundle/yt-dlp.exe
           Invoke-WebRequest "$base/SHA2-256SUMS" -OutFile dist/SHA2-256SUMS
-          $expected = ((Select-String -Path dist/SHA2-256SUMS -Pattern " yt-dlp.exe$").Line -split "\s+")[0]
+          $expected = ((Select-String dist/SHA2-256SUMS -Pattern " yt-dlp.exe$").Line -split "\s+")[0]
           $actual = (Get-FileHash dist/bundle/yt-dlp.exe -Algorithm SHA256).Hash.ToLowerInvariant()
-          if ($actual -ne $expected.ToLowerInvariant()) {
-            throw "yt-dlp.exe checksum mismatch"
-          }
-
-          Compress-Archive -Path dist/bundle/* -DestinationPath dist/crusty-dlp-windows-x86_64.zip
-
-      - name: Upload workflow artifacts
-        uses: actions/upload-artifact@v4
+          if ($actual -ne $expected.ToLowerInvariant()) { throw "yt-dlp.exe checksum mismatch" }
+          Compress-Archive dist/bundle/* dist/crusty-dlp-windows-x86_64.zip
+      - uses: actions/upload-artifact@v4
         with:
-          name: crusty-dlp-windows-x86_64
+          name: windows
           path: |
             dist/crusty-dlp.exe
+            dist/crusty-dlp-gui.exe
             dist/crusty-dlp-windows-x86_64.zip
 
+  macos:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: macos-x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            asset: macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --release --locked --bins --target ${{ matrix.target }}
+      - name: Package macOS bundle
+        env:
+          TARGET: ${{ matrix.target }}
+          ASSET: ${{ matrix.asset }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/bundle
+          cp "target/$TARGET/release/crusty-dlp" "dist/crusty-dlp-$ASSET"
+          cp "target/$TARGET/release/crusty-dlp-gui" "dist/crusty-dlp-gui-$ASSET"
+          cp "target/$TARGET/release/crusty-dlp" "target/$TARGET/release/crusty-dlp-gui" README.md COMPATIBILITY.md LICENSE dist/bundle/
+          cp -R plugins dist/bundle/plugins
+          base=https://github.com/yt-dlp/yt-dlp/releases/latest/download
+          curl -fsSLo dist/bundle/yt-dlp "$base/yt-dlp_macos"
+          curl -fsSLo dist/SHA2-256SUMS "$base/SHA2-256SUMS"
+          expected=$(awk '$2 == "yt-dlp_macos" { print $1 }' dist/SHA2-256SUMS)
+          actual=$(shasum -a 256 dist/bundle/yt-dlp | awk '{ print $1 }')
+          test -n "$expected" && test "$actual" = "$expected"
+          chmod +x dist/bundle/crusty-dlp dist/bundle/yt-dlp
+          chmod +x dist/bundle/crusty-dlp-gui
+          tar -C dist/bundle -czf "dist/crusty-dlp-$ASSET.tar.gz" .
+          ditto -c -k --sequesterRsrc --keepParent dist/bundle "dist/crusty-dlp-$ASSET.zip"
+          app="dist/crusty-dlp-$ASSET.app"
+          version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
+          mkdir -p "$app/Contents/MacOS/plugins"
+          cp "target/$TARGET/release/crusty-dlp-gui" "$app/Contents/MacOS/crusty-dlp-gui"
+          cp dist/bundle/yt-dlp "$app/Contents/MacOS/yt-dlp"
+          cp -R plugins/* "$app/Contents/MacOS/plugins/"
+          plutil -create xml1 "$app/Contents/Info.plist"
+          plutil -insert CFBundleName -string crusty-dlp "$app/Contents/Info.plist"
+          plutil -insert CFBundleDisplayName -string crusty-dlp "$app/Contents/Info.plist"
+          plutil -insert CFBundleIdentifier -string org.crusty-dlp.app "$app/Contents/Info.plist"
+          plutil -insert CFBundleVersion -string "$version" "$app/Contents/Info.plist"
+          plutil -insert CFBundleShortVersionString -string "$version" "$app/Contents/Info.plist"
+          plutil -insert CFBundleExecutable -string crusty-dlp-gui "$app/Contents/Info.plist"
+          plutil -insert LSMinimumSystemVersion -string 12.0 "$app/Contents/Info.plist"
+          plutil -insert NSHighResolutionCapable -bool true "$app/Contents/Info.plist"
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --sequesterRsrc --keepParent "$app" "dist/crusty-dlp-$ASSET-app.zip"
+          hdiutil create -volname crusty-dlp -srcfolder "$app" -ov -format UDZO "dist/crusty-dlp-$ASSET.dmg"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/crusty-dlp-${{ matrix.asset }}
+            dist/crusty-dlp-gui-${{ matrix.asset }}
+            dist/crusty-dlp-${{ matrix.asset }}.tar.gz
+            dist/crusty-dlp-${{ matrix.asset }}.zip
+            dist/crusty-dlp-${{ matrix.asset }}-app.zip
+            dist/crusty-dlp-${{ matrix.asset }}.dmg
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
       - name: Publish GitHub release assets
-        if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        shell: pwsh
         run: |
-          gh release create $env:GITHUB_REF_NAME `
-            --repo $env:GITHUB_REPOSITORY `
-            --generate-notes `
-            --title "crusty-dlp $env:GITHUB_REF_NAME" `
-            dist/crusty-dlp.exe `
-            dist/crusty-dlp-windows-x86_64.zip
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --generate-notes \
+            --title "crusty-dlp $GITHUB_REF_NAME" \
+            dist/*

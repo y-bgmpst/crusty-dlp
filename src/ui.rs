@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, Panel};
+use crusty_dlp::app::{App, DownloadMode, DownloadState, Panel};
 
 const MIN_WIDTH: u16 = 70;
 const MIN_HEIGHT: u16 = 22;
@@ -108,7 +108,7 @@ fn render_controls(frame: &mut Frame, area: Rect, app: &App) {
         format!("Custom format\n{}", app.input)
     } else {
         match &app.mode {
-            crate::app::DownloadMode::Custom(format) => format!("{}\n{}", app.mode.label(), format),
+            DownloadMode::Custom(format) => format!("{}\n{}", app.mode.label(), format),
             _ => format!("{}\nEnter/Space cycles", app.mode.label()),
         }
     };
@@ -178,9 +178,9 @@ fn render_queue(frame: &mut Frame, area: Rect, app: &App) {
     }
     items.extend(app.queue.iter().map(|item| {
         let color = match item.state {
-            crate::app::DownloadState::Finished => Color::Green,
-            crate::app::DownloadState::Failed => Color::Red,
-            crate::app::DownloadState::Cancelled => Color::Yellow,
+            DownloadState::Finished => Color::Green,
+            DownloadState::Failed => Color::Red,
+            DownloadState::Cancelled => Color::Yellow,
             _ => Color::Gray,
         };
         ListItem::new(Line::from(vec![

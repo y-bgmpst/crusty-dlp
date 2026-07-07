@@ -1,11 +1,14 @@
-"""yt-dlp extractor for public PMVHaven video pages."""
+"""yt-dlp extractors for public PMVHaven pages."""
+
+import re
 
 from yt_dlp.extractor.common import InfoExtractor
+from yt_dlp.utils import ExtractorError, orderedSet, urljoin
 
 
 class PMVHavenIE(InfoExtractor):
     IE_NAME = "pmvhaven"
-    _VALID_URL = r"https?://(?:www\.)?pmvhaven\.com/video/(?P<id>[^/?#]+)"
+    _VALID_URL = r"https?://(?:www\.)?pmvhaven\.com/videos?/(?P<id>[^/?#]+)"
 
     def _real_extract(self, url):
         display_id = self._match_id(url)
@@ -32,3 +35,39 @@ class PMVHavenIE(InfoExtractor):
             "formats": formats,
             "age_limit": 18,
         }
+
+
+class PMVHavenPlaylistIE(InfoExtractor):
+    IE_NAME = "pmvhaven:playlist"
+    _VALID_URL = r"https?://(?:www\.)?pmvhaven\.com/playlists/(?P<id>[^/?#]+)"
+
+    def _real_extract(self, url):
+        playlist_id = self._match_id(url)
+        webpage = self._download_webpage(url, playlist_id, impersonate=True)
+
+        entries = []
+        for path in orderedSet(
+            re.findall(r'href=["\'](/videos?/[^"\']+)["\']', webpage)
+        ):
+            entries.append(
+                self.url_result(
+                    urljoin(url, path),
+                    ie=PMVHavenIE.ie_key(),
+                )
+            )
+
+        if not entries:
+            raise ExtractorError("Could not find any playlist entries", expected=True)
+
+        title = self._search_regex(
+            (
+                r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)',
+                r"<title>([^<]+)</title>",
+            ),
+            webpage,
+            "playlist title",
+            default=f"PMVHaven playlist {playlist_id}",
+        )
+        title = re.sub(r"\s*-\s*PMVHaven\s*$", "", title).strip()
+
+        return self.playlist_result(entries, playlist_id, title)

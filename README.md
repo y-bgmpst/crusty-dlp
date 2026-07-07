@@ -1,8 +1,10 @@
 # crusty-dlp
 
-`crusty-dlp` is a small terminal interface for managing a sequential `yt-dlp`
-download queue on Arch Linux and CachyOS. It invokes programs directly with
-argument arrays; URLs, paths, and custom formats are never evaluated by a shell.
+`crusty-dlp` provides native desktop and terminal interfaces for managing a
+sequential `yt-dlp` download queue on Linux, Windows, and macOS. Both interfaces
+share the same safe downloader and configuration code. Programs are invoked
+directly with argument arrays; URLs, paths, and custom formats are never
+evaluated by a shell.
 See [`COMPATIBILITY.md`](COMPATIBILITY.md) for the supported approach to sites
 that require JavaScript, browser sessions, or TLS impersonation.
 
@@ -11,10 +13,10 @@ that require JavaScript, browser sessions, or TLS impersonation.
 - `yt-dlp` (required)
 - `ffmpeg` (optional, required for audio extraction/MP3 and commonly needed when
   merging the best video and audio streams)
-- `python-curl_cffi` (optional, provides browser impersonation and is required
-  for BoyfriendTV downloads)
+- `python-curl_cffi` (optional, enables yt-dlp browser impersonation targets for
+  sites that need them)
 - `deno` (recommended for full YouTube JavaScript challenge support)
-- A normal terminal at least 70 columns by 22 rows
+- A normal terminal at least 70 columns by 22 rows when using the TUI
 
 Install system dependencies:
 
@@ -32,13 +34,16 @@ sudo pacman -S rust
 
 ```console
 cargo build --release
-./target/release/crusty-dlp
+./target/release/crusty-dlp-gui
 ```
+
+Use `./target/release/crusty-dlp` to start the terminal interface instead.
 
 To install for the current user:
 
 ```console
 install -Dm755 target/release/crusty-dlp ~/.local/bin/crusty-dlp
+install -Dm755 target/release/crusty-dlp-gui ~/.local/bin/crusty-dlp-gui
 ```
 
 Both bash and fish can run the resulting binary; no shell-specific integration
@@ -47,13 +52,14 @@ its placeholder project URL and checksum before using it to publish a package.
 
 ### Windows
 
-GitHub Releases provide two Windows assets:
+GitHub Releases provide standalone TUI and GUI executables plus a complete ZIP:
 
 - `crusty-dlp.exe` for users who already have `yt-dlp.exe` in `PATH` or beside
   the application.
-- `crusty-dlp-windows-x86_64.zip`, containing crusty-dlp and a checksum-verified
-  official `yt-dlp.exe`. Extract both files into one folder and run
-  `crusty-dlp.exe` from Windows Terminal.
+- `crusty-dlp-gui.exe` starts the native graphical interface.
+- `crusty-dlp-windows-x86_64.zip` contains both interfaces and a
+  checksum-verified official `yt-dlp.exe`. Extract the archive and run
+  `crusty-dlp-gui.exe` normally or `crusty-dlp.exe` from Windows Terminal.
 
 Install `ffmpeg` separately when using conversion or stream merging. Full
 YouTube support also needs Deno; install it with:
@@ -62,12 +68,38 @@ YouTube support also needs Deno; install it with:
 winget install DenoLand.Deno
 ```
 
-Every push is tested natively on Linux and Windows. Version tags matching `v*`
-build and attach the EXE and ZIP to a GitHub Release automatically.
+Every push is tested natively on Linux, Windows, and macOS. Version tags
+matching `v*` build and attach the platform archives to a GitHub Release
+automatically.
+
+### macOS
+
+GitHub Releases provide native Intel (`x86_64`) and Apple Silicon (`aarch64`)
+executables, `.app` ZIPs, DMG images, and portable archives. The bundles contain
+both interfaces, extractor plugins, and a checksum-verified `yt-dlp`. Open the
+app from a DMG or extract a portable bundle and run:
+
+```sh
+chmod +x crusty-dlp yt-dlp
+./crusty-dlp-gui
+```
+
+The app receives an ad-hoc signature in CI, but is not Apple-notarized. If
+Gatekeeper blocks a release you trust, allow it from System Settings > Privacy
+& Security. Full signing and notarization require Apple Developer credentials.
 
 ## Usage
 
-Start with an empty queue:
+Start the graphical interface:
+
+```console
+crusty-dlp-gui
+```
+
+The GUI provides URL entry, mode and folder selection, browser cookies,
+impersonation, connection controls, queue progress, cancellation, and logs.
+
+Start the terminal interface with an empty queue:
 
 ```console
 crusty-dlp
@@ -142,27 +174,21 @@ If no target is installed, crusty-dlp displays the correct Arch/CachyOS command:
 sudo pacman -S python-curl_cffi
 ```
 
-### BoyfriendTV
+### Session-gated and JavaScript-heavy sites
 
-BoyfriendTV video-page URLs are recognized directly. When impersonation is set
-to `None`, crusty-dlp automatically asks yt-dlp's generic extractor to use any
-available target for that URL. A bundled yt-dlp extractor plugin reads the
-page's public media source list and supports direct files and HLS manifests.
-This requires `python-curl_cffi`; the application shows an actionable error if
-it is unavailable. Support is independently implemented and does not copy code
-from the unlicensed third-party userscript.
+Some supported sites need a recent browser session, yt-dlp impersonation, or
+both before the page can be inspected reliably. crusty-dlp exposes those
+controls directly:
 
-### PMVHaven and SpankBang
+- choose an impersonation target when yt-dlp reports one is available
+- press `b` to use cookies from a local browser without copying cookie data into
+  the app
+- retry with a fresh browser session if the site returns anti-bot or access
+  errors
 
-PMVHaven video URLs use the bundled extractor plugin to read the page's public
-VideoObject metadata and HLS manifest.
-
-SpankBang uses Cloudflare checks that can require a recent browser session. Open
-the video in your browser first, press `b` in crusty-dlp until the same browser
-is selected, and retry within roughly 30 minutes. The application passes cookies
-directly from that browser and aligns impersonation to its browser family; it
-does not store the cookies or bypass CAPTCHA/access controls. Close the browser
-if its cookie database is locked.
+The application passes browser state through yt-dlp only for the current
+download, does not store cookie contents, and does not bypass access controls.
+See [`COMPATIBILITY.md`](COMPATIBILITY.md) for site notes and packaging details.
 
 ## Configuration
 
@@ -178,12 +204,16 @@ changing and saving a configurable value. See [`config.example.toml`](config.exa
 
 ```toml
 output_dir = "/home/alice/Downloads"
+output_template = "%(title)s [%(id)s].%(ext)s"
 default_mode = "video"
 custom_format = "bestvideo+bestaudio/best"
 impersonation = "none"
 cookies_browser = "none"
 concurrent_fragments = 4
 use_aria2 = false
+rate_limit = ""
+max_active_downloads = 1
+allow_playlists = false
 ```
 
 ## Troubleshooting

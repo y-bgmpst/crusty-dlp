@@ -1,0 +1,915 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+    time::Duration,
+};
+
+use crusty_dlp::{
+    app::{validate_url, DownloadMode, DownloadState},
+    config::Config,
+    downloader::{
+        available_impersonation_targets, dependency_path, expand_playlist_urls,
+        supports_playlist_expansion, validate_output_template, validate_rate_limit, DownloadEvent,
+        DownloadOptions, Downloader,
+    },
+};
+use eframe::egui::{self, Color32, RichText};
+use tokio::sync::{mpsc, oneshot};
+
+const BLUE: Color32 = Color32::from_rgb(47, 128, 237);
+const GREEN: Color32 = Color32::from_rgb(72, 180, 90);
+const RED: Color32 = Color32::from_rgb(235, 87, 87);
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("crusty-dlp")
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([960.0, 660.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "crusty-dlp",
+        options,
+        Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
+    )
+}
+
+#[derive(Debug)]
+struct GuiQueueItem {
+    url: String,
+    state: DownloadState,
+    progress: f32,
+    progress_text: String,
+    error: Option<String>,
+}
+
+#[derive(Debug)]
+struct JobEvent {
+    index: usize,
+    event: DownloadEvent,
+}
+
+struct GuiApp {
+    config: Config,
+    config_path: Option<PathBuf>,
+    input: String,
+    output_dir_text: String,
+    output_template_text: String,
+    rate_limit_text: String,
+    mode: DownloadMode,
+    queue: Vec<GuiQueueItem>,
+    queue_running: bool,
+    active_downloads: HashMap<usize, oneshot::Sender<()>>,
+    event_tx: mpsc::UnboundedSender<JobEvent>,
+    event_rx: mpsc::UnboundedReceiver<JobEvent>,
+    impersonation_targets: Vec<String>,
+    logs: VecDeque<String>,
+    status: String,
+}
+
+impl GuiApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        configure_style(&cc.egui_ctx);
+        let config_path = Config::path().ok();
+        let config = config_path
+            .as_deref()
+            .and_then(|path| Config::load(path).ok())
+            .unwrap_or_default();
+        let mode = match config.default_mode.as_str() {
+            "audio" => DownloadMode::Audio,
+            "mp3" => DownloadMode::Mp3,
+            "custom" => DownloadMode::Custom(config.custom_format.clone()),
+            _ => DownloadMode::Video,
+        };
+        let yt_dlp = dependency_path("yt-dlp");
+        let impersonation_targets = yt_dlp
+            .as_deref()
+            .map(available_impersonation_targets)
+            .unwrap_or_default();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let status = if yt_dlp.is_some() {
+            "Ready".to_owned()
+        } else {
+            "yt-dlp was not found in PATH or beside the application".to_owned()
+        };
+        Self {
+            output_dir_text: config.output_dir.to_string_lossy().into_owned(),
+            output_template_text: config.output_template.clone(),
+            rate_limit_text: config.rate_limit.clone(),
+            config,
+            config_path,
+            input: String::new(),
+            mode,
+            queue: Vec::new(),
+            queue_running: false,
+            active_downloads: HashMap::new(),
+            event_tx,
+            event_rx,
+            impersonation_targets,
+            logs: VecDeque::new(),
+            status,
+        }
+    }
+
+    fn save_config(&mut self) {
+        if let Some(path) = &self.config_path {
+            if let Err(error) = self.config.save(path) {
+                self.status = error.to_string();
+            }
+        }
+    }
+
+    fn log(&mut self, message: impl Into<String>) {
+        if self.logs.len() == 200 {
+            self.logs.pop_front();
+        }
+        self.logs.push_back(message.into());
+    }
+
+    fn add_input(&mut self) {
+        let values: Vec<_> = self.input.split_whitespace().map(str::to_owned).collect();
+        if values.is_empty() {
+            self.status = "Enter at least one URL".into();
+            return;
+        }
+        let mut added = 0;
+        for url in values {
+            match self.expand_or_enqueue(&url) {
+                Ok(count) => added += count,
+                Err(error) => self.log(format!("Rejected URL: {error}")),
+            }
+        }
+        if added > 0 {
+            self.input.clear();
+            self.status = format!("Added {added} item(s) to the queue");
+        } else {
+            self.status = "No valid URLs were added".into();
+        }
+    }
+
+    fn expand_or_enqueue(&mut self, url: &str) -> Result<usize, String> {
+        validate_url(url).map_err(|error| error.to_string())?;
+        if self.config.allow_playlists && supports_playlist_expansion(url) {
+            let yt_dlp = dependency_path("yt-dlp").ok_or_else(|| {
+                "yt-dlp was not found in PATH or beside the application".to_owned()
+            })?;
+            match expand_playlist_urls(&yt_dlp, url) {
+                Ok(Some(entries)) => {
+                    for entry in &entries {
+                        self.enqueue_url(entry);
+                    }
+                    self.log(format!(
+                        "Expanded playlist into {} item(s): {url}",
+                        entries.len()
+                    ));
+                    return Ok(entries.len());
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.enqueue_url(url);
+        Ok(1)
+    }
+
+    fn enqueue_url(&mut self, url: &str) {
+        self.log(format!("Added to queue: {url}"));
+        self.queue.push(GuiQueueItem {
+            url: url.to_owned(),
+            state: DownloadState::Waiting,
+            progress: 0.0,
+            progress_text: String::new(),
+            error: None,
+        });
+    }
+
+    fn apply_output_dir(&mut self) -> bool {
+        let trimmed = self.output_dir_text.trim();
+        if trimmed.is_empty() {
+            self.status = "Output folder cannot be empty".into();
+            return false;
+        }
+        self.config.output_dir = PathBuf::from(trimmed);
+        self.output_dir_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn apply_output_template(&mut self) -> bool {
+        let trimmed = self.output_template_text.trim();
+        if let Err(error) = validate_output_template(trimmed) {
+            self.status = error;
+            return false;
+        }
+        self.config.output_template = trimmed.to_owned();
+        self.output_template_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn apply_rate_limit(&mut self) -> bool {
+        let trimmed = self.rate_limit_text.trim();
+        if let Err(error) = validate_rate_limit(trimmed) {
+            self.status = error;
+            return false;
+        }
+        self.config.rate_limit = trimmed.to_owned();
+        self.rate_limit_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn start_queue(&mut self) {
+        if self.active_downloads.is_empty()
+            && !self
+                .queue
+                .iter()
+                .any(|item| item.state == DownloadState::Waiting)
+        {
+            self.status = "Queue is empty".into();
+            return;
+        }
+        self.queue_running = true;
+        self.fill_slots();
+    }
+
+    fn fill_slots(&mut self) {
+        let max_active = usize::from(self.config.max_active_downloads.clamp(1, 8));
+        while self.queue_running && self.active_downloads.len() < max_active {
+            let Some(index) = self
+                .queue
+                .iter()
+                .position(|item| item.state == DownloadState::Waiting)
+            else {
+                if self.active_downloads.is_empty() {
+                    self.queue_running = false;
+                    self.status = "Queue finished".into();
+                }
+                return;
+            };
+            if !self.start_job(index) {
+                self.queue_running = false;
+                return;
+            }
+        }
+    }
+
+    fn start_job(&mut self, index: usize) -> bool {
+        let Some(yt_dlp) = dependency_path("yt-dlp") else {
+            self.fail(
+                index,
+                "yt-dlp was not found in PATH or beside the application",
+            );
+            return false;
+        };
+        if self.mode.needs_ffmpeg() && dependency_path("ffmpeg").is_none() {
+            self.fail(index, "ffmpeg is required for this download mode");
+            return false;
+        }
+        if !self.apply_output_dir() || !self.apply_output_template() || !self.apply_rate_limit() {
+            self.fail(index, &self.status.clone());
+            return false;
+        }
+
+        let url = self.queue[index].url.clone();
+        let mode = self.mode.clone();
+        let options = match OwnedDownloadOptions::from_config(&self.config, &url) {
+            Ok(options) => options,
+            Err(message) => {
+                self.fail(index, &message);
+                return false;
+            }
+        };
+        let downloader = Downloader::new(yt_dlp, self.config.output_dir.clone());
+        let args = downloader.arguments(&url, &mode, options.borrow());
+        let (cancel_tx, cancel_rx) = oneshot::channel();
+        let (download_tx, mut download_rx) = mpsc::unbounded_channel();
+        let event_tx = self.event_tx.clone();
+
+        self.active_downloads.insert(index, cancel_tx);
+        self.queue[index].state = DownloadState::Downloading;
+        self.queue[index].progress = 0.0;
+        self.queue[index].progress_text.clear();
+        self.queue[index].error = None;
+        self.status = format!("Running {} active download(s)", self.active_downloads.len());
+        self.log(format!("Starting download: {url}"));
+
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match runtime {
+                Ok(runtime) => runtime.block_on(async move {
+                    let forward_tx = event_tx.clone();
+                    let forward = tokio::spawn(async move {
+                        while let Some(event) = download_rx.recv().await {
+                            let _ = forward_tx.send(JobEvent { index, event });
+                        }
+                    });
+                    downloader.run(args, cancel_rx, download_tx).await;
+                    let _ = forward.await;
+                }),
+                Err(error) => {
+                    let _ = event_tx.send(JobEvent {
+                        index,
+                        event: DownloadEvent::Failed(format!(
+                            "could not start async runtime: {error}"
+                        )),
+                    });
+                }
+            }
+        });
+        true
+    }
+
+    fn fail(&mut self, index: usize, message: &str) {
+        self.queue[index].state = DownloadState::Failed;
+        self.queue[index].error = Some(message.to_owned());
+        self.status = message.to_owned();
+        self.log(format!("ERROR: {message}"));
+    }
+
+    fn cancel(&mut self) {
+        self.queue_running = false;
+        if self.active_downloads.is_empty() {
+            self.status = "No active downloads".into();
+            return;
+        }
+        for (_, cancel_tx) in self.active_downloads.drain() {
+            let _ = cancel_tx.send(());
+        }
+        self.status = "Cancelling active downloads…".into();
+    }
+
+    fn process_events(&mut self) {
+        while let Ok(job) = self.event_rx.try_recv() {
+            if job.index >= self.queue.len() {
+                continue;
+            }
+            match job.event {
+                DownloadEvent::Progress { percent, text } => {
+                    self.queue[job.index].progress = percent.unwrap_or_default() as f32 / 100.0;
+                    self.queue[job.index].progress_text = text;
+                }
+                DownloadEvent::Finished => {
+                    self.queue[job.index].state = DownloadState::Finished;
+                    self.queue[job.index].progress = 1.0;
+                    self.queue[job.index].progress_text = "done".into();
+                    self.queue[job.index].error = None;
+                    self.active_downloads.remove(&job.index);
+                    self.log(format!("Finished: {}", self.queue[job.index].url));
+                    self.status = "Download finished".into();
+                }
+                DownloadEvent::Failed(message) => {
+                    self.queue[job.index].state = DownloadState::Failed;
+                    self.queue[job.index].error = Some(message.clone());
+                    self.active_downloads.remove(&job.index);
+                    self.log(format!("ERROR: {message}"));
+                    self.status = "Download failed".into();
+                }
+                DownloadEvent::Cancelled => {
+                    self.queue[job.index].state = DownloadState::Cancelled;
+                    self.queue[job.index].progress_text = "cancelled".into();
+                    self.active_downloads.remove(&job.index);
+                    self.log(format!("Cancelled: {}", self.queue[job.index].url));
+                    self.status = "Download cancelled".into();
+                }
+            }
+        }
+
+        if self.queue_running {
+            self.fill_slots();
+        } else if self.active_downloads.is_empty()
+            && self
+                .queue
+                .iter()
+                .all(|item| item.state != DownloadState::Waiting)
+        {
+            self.status = "Queue idle".into();
+        }
+    }
+
+    fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("URL");
+        let response = ui.add(
+            egui::TextEdit::singleline(&mut self.input)
+                .hint_text("https://example.com/video")
+                .desired_width(f32::INFINITY),
+        );
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            self.add_input();
+        }
+        if ui
+            .add_sized(
+                [ui.available_width(), 38.0],
+                egui::Button::new(RichText::new("＋  Add to queue").strong()).fill(BLUE),
+            )
+            .clicked()
+        {
+            self.add_input();
+        }
+
+        ui.add_space(18.0);
+        ui.heading("Download mode");
+        let previous_mode = self.mode.clone();
+        egui::ComboBox::from_id_salt("download-mode")
+            .selected_text(self.mode.label())
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.mode, DownloadMode::Video, "Video - best quality");
+                ui.selectable_value(&mut self.mode, DownloadMode::Audio, "Audio - best quality");
+                ui.selectable_value(&mut self.mode, DownloadMode::Mp3, "MP3 - convert audio");
+                ui.selectable_value(
+                    &mut self.mode,
+                    DownloadMode::Custom(self.config.custom_format.clone()),
+                    "Custom format",
+                );
+            });
+        if matches!(self.mode, DownloadMode::Custom(_)) {
+            if ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.config.custom_format)
+                        .hint_text("yt-dlp format selector")
+                        .desired_width(f32::INFINITY),
+                )
+                .changed()
+            {
+                self.save_config();
+            }
+            self.mode = DownloadMode::Custom(self.config.custom_format.clone());
+        }
+        if self.mode != previous_mode {
+            self.config.default_mode = match self.mode {
+                DownloadMode::Video => "video",
+                DownloadMode::Audio => "audio",
+                DownloadMode::Mp3 => "mp3",
+                DownloadMode::Custom(_) => "custom",
+            }
+            .into();
+            self.save_config();
+        }
+
+        ui.add_space(18.0);
+        ui.heading("Output");
+        let folder_response = ui.add(
+            egui::TextEdit::singleline(&mut self.output_dir_text)
+                .hint_text("/home/user/Downloads")
+                .desired_width(f32::INFINITY),
+        );
+        ui.horizontal(|ui| {
+            if ui.button("Use typed path").clicked() {
+                self.apply_output_dir();
+            }
+            if ui.button("Browse...").clicked() {
+                if let Some(path) = self.browse_output_dir() {
+                    self.config.output_dir = path.clone();
+                    self.output_dir_text = path.display().to_string();
+                    self.save_config();
+                }
+            }
+        });
+        if folder_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            self.apply_output_dir();
+        }
+
+        ui.add_space(18.0);
+        ui.heading("Cookies browser");
+        egui::ComboBox::from_id_salt("cookies-browser")
+            .selected_text(display_none(&self.config.cookies_browser))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                for browser in [
+                    "none", "firefox", "chrome", "chromium", "brave", "edge", "vivaldi", "safari",
+                ] {
+                    if ui
+                        .selectable_value(
+                            &mut self.config.cookies_browser,
+                            browser.to_owned(),
+                            display_none(browser),
+                        )
+                        .changed()
+                    {
+                        self.save_config();
+                    }
+                }
+            });
+
+        ui.add_space(18.0);
+        ui.heading("Impersonation");
+        egui::ComboBox::from_id_salt("impersonation")
+            .selected_text(display_none(&self.config.impersonation))
+            .width(ui.available_width())
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_value(&mut self.config.impersonation, "none".into(), "None")
+                    .changed()
+                {
+                    self.save_config();
+                }
+                if ui
+                    .selectable_value(
+                        &mut self.config.impersonation,
+                        "any".into(),
+                        "Any available",
+                    )
+                    .changed()
+                {
+                    self.save_config();
+                }
+                for target in self.impersonation_targets.clone() {
+                    if ui
+                        .selectable_value(&mut self.config.impersonation, target.clone(), &target)
+                        .changed()
+                    {
+                        self.save_config();
+                    }
+                }
+            });
+
+        ui.add_space(18.0);
+        egui::CollapsingHeader::new("Advanced yt-dlp options")
+            .default_open(true)
+            .show(ui, |ui| self.advanced_settings_panel(ui));
+    }
+
+    fn browse_output_dir(&mut self) -> Option<PathBuf> {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.status = format!("Could not start folder picker runtime: {error}");
+                return None;
+            }
+        };
+        let _guard = runtime.enter();
+        rfd::FileDialog::new()
+            .set_directory(&self.config.output_dir)
+            .pick_folder()
+    }
+
+    fn advanced_settings_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(RichText::new("Filename template").strong());
+        let template_response = ui.add(
+            egui::TextEdit::singleline(&mut self.output_template_text)
+                .hint_text("%(title)s [%(id)s].%(ext)s")
+                .desired_width(f32::INFINITY),
+        );
+        if template_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            self.apply_output_template();
+        }
+        ui.small("Maps to yt-dlp --output and must stay relative to the output folder.");
+
+        ui.add_space(12.0);
+        ui.label(RichText::new("Transfer").strong());
+        ui.horizontal(|ui| {
+            ui.label("Connections");
+            if ui
+                .add(egui::Slider::new(
+                    &mut self.config.concurrent_fragments,
+                    1..=16,
+                ))
+                .changed()
+            {
+                self.save_config();
+            }
+        });
+        if ui
+            .checkbox(&mut self.config.use_aria2, "Use aria2")
+            .changed()
+        {
+            self.save_config();
+        }
+        ui.small("More than 8 connections can increase throttling or HTTP 403 errors.");
+
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            ui.label("Parallel downloads");
+            if ui
+                .add(
+                    egui::DragValue::new(&mut self.config.max_active_downloads)
+                        .range(1..=8)
+                        .speed(0.1),
+                )
+                .changed()
+            {
+                self.config.max_active_downloads = self.config.max_active_downloads.clamp(1, 8);
+                self.save_config();
+            }
+        });
+
+        if ui
+            .checkbox(
+                &mut self.config.allow_playlists,
+                "Allow playlists (supported: YouTube, PMVHaven, SpankBang)",
+            )
+            .changed()
+        {
+            self.save_config();
+        }
+        ui.small("Disabled by default. Supported playlist URLs are expanded into queue entries before downloading.");
+
+        ui.horizontal(|ui| {
+            ui.label("Speed limit");
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.rate_limit_text)
+                    .hint_text("blank = unlimited, e.g. 5M")
+                    .desired_width(170.0),
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.apply_rate_limit();
+            }
+            if ui.button("Apply").clicked() {
+                self.apply_rate_limit();
+            }
+        });
+        ui.small("The limit applies per active download process.");
+    }
+
+    fn queue_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.heading(format!("Queue ({})", self.queue.len()));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(
+                        self.active_downloads.is_empty(),
+                        egui::Button::new("Clear completed"),
+                    )
+                    .clicked()
+                {
+                    self.queue.retain(|item| {
+                        !matches!(
+                            item.state,
+                            DownloadState::Finished
+                                | DownloadState::Failed
+                                | DownloadState::Cancelled
+                        )
+                    });
+                }
+            });
+        });
+        ui.separator();
+        egui::ScrollArea::vertical()
+            .max_height(390.0)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if self.queue.is_empty() {
+                    ui.add_space(60.0);
+                    ui.vertical_centered(|ui| {
+                        ui.label(RichText::new("Queue is empty").size(18.0));
+                        ui.label("Add one or more URLs to begin.");
+                    });
+                }
+                for (index, item) in self.queue.iter().enumerate() {
+                    egui::Frame::group(ui.style()).show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{}", index + 1)).strong());
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(short_url(&item.url)).strong());
+                                ui.small(&item.url);
+                            });
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(
+                                        RichText::new(item.state.label())
+                                            .color(state_color(item.state)),
+                                    );
+                                },
+                            );
+                        });
+                        if matches!(
+                            item.state,
+                            DownloadState::Downloading | DownloadState::Finished
+                        ) {
+                            ui.add(
+                                egui::ProgressBar::new(item.progress)
+                                    .desired_width(ui.available_width())
+                                    .show_percentage(),
+                            );
+                            if !item.progress_text.is_empty() {
+                                ui.small(&item.progress_text);
+                            }
+                        }
+                        if let Some(error) = &item.error {
+                            ui.label(RichText::new(error).color(RED));
+                        }
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+
+        ui.add_space(10.0);
+        ui.heading(format!(
+            "Active downloads ({}/{})",
+            self.active_downloads.len(),
+            self.config.max_active_downloads.clamp(1, 8)
+        ));
+        if self.active_downloads.is_empty() {
+            ui.label("No active downloads");
+        } else {
+            for index in active_indices(&self.active_downloads) {
+                if let Some(item) = self.queue.get(index) {
+                    ui.label(RichText::new(short_url(&item.url)).strong());
+                    ui.add(
+                        egui::ProgressBar::new(item.progress)
+                            .desired_width(ui.available_width())
+                            .show_percentage(),
+                    );
+                    if !item.progress_text.is_empty() {
+                        ui.small(&item.progress_text);
+                    }
+                    ui.add_space(6.0);
+                }
+            }
+        }
+
+        ui.horizontal(|ui| {
+            let start = ui.add_sized(
+                [ui.available_width() * 0.65, 40.0],
+                egui::Button::new(RichText::new("Start queue").strong()).fill(BLUE),
+            );
+            if start.clicked() {
+                self.start_queue();
+            }
+            if ui
+                .add_sized(
+                    [ui.available_width(), 40.0],
+                    egui::Button::new("Cancel active"),
+                )
+                .clicked()
+            {
+                self.cancel();
+            }
+        });
+
+        ui.add_space(10.0);
+        egui::CollapsingHeader::new("Log")
+            .default_open(true)
+            .show(ui, |ui| {
+                egui::ScrollArea::vertical()
+                    .max_height(130.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        for line in &self.logs {
+                            ui.monospace(line);
+                        }
+                    });
+                if ui.small_button("Clear log").clicked() {
+                    self.logs.clear();
+                }
+            });
+    }
+}
+
+impl eframe::App for GuiApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.process_events();
+        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading(RichText::new("crusty-dlp").strong());
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(&self.status);
+                });
+            });
+        });
+        egui::SidePanel::left("settings")
+            .resizable(false)
+            .default_width(380.0)
+            .min_width(380.0)
+            .max_width(380.0)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .inner_margin(egui::Margin::same(12))
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| self.settings_panel(ui));
+                    });
+            });
+        egui::CentralPanel::default().show(ctx, |ui| self.queue_panel(ui));
+        egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                let yt_dlp = dependency_path("yt-dlp")
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "not found".into());
+                ui.label(format!("yt-dlp: {yt_dlp}"));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let waiting = self
+                        .queue
+                        .iter()
+                        .filter(|item| item.state == DownloadState::Waiting)
+                        .count();
+                    ui.label(format!("{waiting} queued"));
+                    ui.separator();
+                    ui.label(format!("{} active", self.active_downloads.len()));
+                });
+            });
+        });
+        ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+struct OwnedDownloadOptions {
+    impersonation: Option<String>,
+    cookies_browser: Option<String>,
+    concurrent_fragments: u8,
+    use_aria2: bool,
+    output_template: String,
+    rate_limit: Option<String>,
+    allow_playlists: bool,
+}
+
+impl OwnedDownloadOptions {
+    fn from_config(config: &Config, url: &str) -> Result<Self, String> {
+        validate_output_template(&config.output_template)?;
+        validate_rate_limit(&config.rate_limit)?;
+
+        let browser = (config.cookies_browser != "none").then(|| config.cookies_browser.clone());
+        let mut impersonation =
+            (config.impersonation != "none").then(|| config.impersonation.clone());
+        if url.contains("spankbang.com") && impersonation.is_none() {
+            impersonation = browser
+                .as_deref()
+                .map(browser_impersonation)
+                .map(str::to_owned);
+        } else if url.contains("boyfriendtv.com") && impersonation.is_none() {
+            impersonation = Some("any".into());
+        }
+
+        Ok(Self {
+            impersonation,
+            cookies_browser: browser,
+            concurrent_fragments: config.concurrent_fragments.clamp(1, 16),
+            use_aria2: config.use_aria2 && dependency_path("aria2c").is_some(),
+            output_template: config.output_template.trim().to_owned(),
+            rate_limit: (!config.rate_limit.trim().is_empty())
+                .then(|| config.rate_limit.trim().to_owned()),
+            allow_playlists: config.allow_playlists,
+        })
+    }
+
+    fn borrow(&self) -> DownloadOptions<'_> {
+        DownloadOptions {
+            impersonation: self.impersonation.as_deref(),
+            cookies_browser: self.cookies_browser.as_deref(),
+            concurrent_fragments: self.concurrent_fragments,
+            use_aria2: self.use_aria2,
+            output_template: Some(self.output_template.as_str()),
+            rate_limit: self.rate_limit.as_deref(),
+            allow_playlists: self.allow_playlists,
+        }
+    }
+}
+
+fn configure_style(ctx: &egui::Context) {
+    let mut visuals = egui::Visuals::dark();
+    visuals.panel_fill = Color32::from_rgb(28, 32, 36);
+    visuals.window_fill = Color32::from_rgb(31, 36, 41);
+    visuals.extreme_bg_color = Color32::from_rgb(23, 27, 31);
+    visuals.selection.bg_fill = BLUE;
+    visuals.widgets.active.bg_fill = BLUE;
+    ctx.set_visuals(visuals);
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(8.0, 8.0);
+    style.spacing.button_padding = egui::vec2(12.0, 8.0);
+    ctx.set_style(style);
+}
+
+fn active_indices(active_downloads: &HashMap<usize, oneshot::Sender<()>>) -> Vec<usize> {
+    let mut indices: Vec<_> = active_downloads.keys().copied().collect();
+    indices.sort_unstable();
+    indices
+}
+
+fn state_color(state: DownloadState) -> Color32 {
+    match state {
+        DownloadState::Downloading => BLUE,
+        DownloadState::Finished => GREEN,
+        DownloadState::Failed | DownloadState::Cancelled => RED,
+        DownloadState::Waiting => Color32::LIGHT_GRAY,
+    }
+}
+
+fn display_none(value: &str) -> &str {
+    if value == "none" {
+        "None"
+    } else {
+        value
+    }
+}
+
+fn browser_impersonation(browser: &str) -> &str {
+    match browser {
+        "firefox" => "firefox",
+        "edge" => "edge",
+        "chrome" | "chromium" | "brave" | "vivaldi" => "chrome",
+        _ => "any",
+    }
+}
+
+fn short_url(url: &str) -> &str {
+    url.split_once("://")
+        .map(|(_, remainder)| remainder)
+        .unwrap_or(url)
+}

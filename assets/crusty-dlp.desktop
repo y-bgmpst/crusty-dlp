@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=crusty-dlp
+Comment=Download videos and audio with yt-dlp
+Exec=crusty-dlp-gui
+Icon=video-x-generic
+Terminal=false
+Categories=AudioVideo;Network;
+Keywords=video;audio;download;yt-dlp;
