@@ -20,6 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 const BLUE: Color32 = Color32::from_rgb(47, 128, 237);
 const GREEN: Color32 = Color32::from_rgb(72, 180, 90);
 const RED: Color32 = Color32::from_rgb(235, 87, 87);
+const AMBER: Color32 = Color32::from_rgb(217, 154, 34);
+const PANEL: Color32 = Color32::from_rgb(31, 36, 41);
+const PANEL_ALT: Color32 = Color32::from_rgb(36, 42, 48);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -327,9 +330,10 @@ impl GuiApp {
     }
 
     fn fail(&mut self, index: usize, message: &str) {
+        let message = friendly_error(&self.queue[index].url, message);
         self.queue[index].state = DownloadState::Failed;
-        self.queue[index].error = Some(message.to_owned());
-        self.status = message.to_owned();
+        self.queue[index].error = Some(message.clone());
+        self.status = message.clone();
         self.log(format!("ERROR: {message}"));
     }
 
@@ -423,153 +427,175 @@ impl GuiApp {
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
-        ui.heading("URL");
-        let response = ui.add(
-            egui::TextEdit::singleline(&mut self.input)
-                .hint_text("https://example.com/video")
-                .desired_width(f32::INFINITY),
-        );
-        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-            self.add_input();
-        }
-        if ui
-            .add_sized(
-                [ui.available_width(), 38.0],
-                egui::Button::new(RichText::new("＋  Add to queue").strong()).fill(BLUE),
-            )
-            .clicked()
-        {
-            self.add_input();
-        }
-
-        ui.add_space(18.0);
-        ui.heading("Download mode");
-        let previous_mode = self.mode.clone();
-        egui::ComboBox::from_id_salt("download-mode")
-            .selected_text(self.mode.label())
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.mode, DownloadMode::Video, "Video - best quality");
-                ui.selectable_value(&mut self.mode, DownloadMode::Audio, "Audio - best quality");
-                ui.selectable_value(&mut self.mode, DownloadMode::Mp3, "MP3 - convert audio");
-                ui.selectable_value(
-                    &mut self.mode,
-                    DownloadMode::Custom(self.config.custom_format.clone()),
-                    "Custom format",
-                );
-            });
-        if matches!(self.mode, DownloadMode::Custom(_)) {
+        section_frame(ui, "URL", |ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.input)
+                    .hint_text("https://example.com/video")
+                    .desired_width(f32::INFINITY),
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.add_input();
+            }
+            ui.add_space(8.0);
             if ui
-                .add(
-                    egui::TextEdit::singleline(&mut self.config.custom_format)
-                        .hint_text("yt-dlp format selector")
-                        .desired_width(f32::INFINITY),
-                )
-                .changed()
-            {
-                self.save_config();
-            }
-            self.mode = DownloadMode::Custom(self.config.custom_format.clone());
-        }
-        if self.mode != previous_mode {
-            self.config.default_mode = match self.mode {
-                DownloadMode::Video => "video",
-                DownloadMode::Audio => "audio",
-                DownloadMode::Mp3 => "mp3",
-                DownloadMode::Custom(_) => "custom",
-            }
-            .into();
-            self.save_config();
-        }
-
-        ui.add_space(18.0);
-        ui.heading("Output");
-        let folder_response = ui.add(
-            egui::TextEdit::singleline(&mut self.output_dir_text)
-                .hint_text("/home/user/Downloads")
-                .desired_width(f32::INFINITY),
-        );
-        ui.horizontal(|ui| {
-            if ui.button("Use typed path").clicked() {
-                self.apply_output_dir();
-            }
-            let browse_label = if self.folder_picker_rx.is_some() {
-                "Browse… (opening)"
-            } else {
-                "Browse..."
-            };
-            if ui
-                .add_enabled(
-                    self.folder_picker_rx.is_none(),
-                    egui::Button::new(browse_label),
+                .add_sized(
+                    [ui.available_width(), 38.0],
+                    egui::Button::new(RichText::new("＋  Add to queue").strong()).fill(BLUE),
                 )
                 .clicked()
             {
-                self.browse_output_dir();
+                self.add_input();
             }
         });
-        if folder_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-            self.apply_output_dir();
-        }
 
-        ui.add_space(18.0);
-        ui.heading("Cookies browser");
-        egui::ComboBox::from_id_salt("cookies-browser")
-            .selected_text(display_none(&self.config.cookies_browser))
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
-                for browser in [
-                    "none", "firefox", "chrome", "chromium", "brave", "edge", "vivaldi", "safari",
-                ] {
-                    if ui
-                        .selectable_value(
-                            &mut self.config.cookies_browser,
-                            browser.to_owned(),
-                            display_none(browser),
-                        )
-                        .changed()
-                    {
-                        self.save_config();
-                    }
-                }
-            });
-
-        ui.add_space(18.0);
-        ui.heading("Impersonation");
-        egui::ComboBox::from_id_salt("impersonation")
-            .selected_text(display_none(&self.config.impersonation))
-            .width(ui.available_width())
-            .show_ui(ui, |ui| {
+        ui.add_space(14.0);
+        section_frame(ui, "Download mode", |ui| {
+            let previous_mode = self.mode.clone();
+            egui::ComboBox::from_id_salt("download-mode")
+                .selected_text(self.mode.label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut self.mode,
+                        DownloadMode::Video,
+                        "Video - best quality",
+                    );
+                    ui.selectable_value(
+                        &mut self.mode,
+                        DownloadMode::Audio,
+                        "Audio - best quality",
+                    );
+                    ui.selectable_value(&mut self.mode, DownloadMode::Mp3, "MP3 - convert audio");
+                    ui.selectable_value(
+                        &mut self.mode,
+                        DownloadMode::Custom(self.config.custom_format.clone()),
+                        "Custom format",
+                    );
+                });
+            if matches!(self.mode, DownloadMode::Custom(_)) {
+                ui.add_space(8.0);
                 if ui
-                    .selectable_value(&mut self.config.impersonation, "none".into(), "None")
-                    .changed()
-                {
-                    self.save_config();
-                }
-                if ui
-                    .selectable_value(
-                        &mut self.config.impersonation,
-                        "any".into(),
-                        "Any available",
+                    .add(
+                        egui::TextEdit::singleline(&mut self.config.custom_format)
+                            .hint_text("yt-dlp format selector")
+                            .desired_width(f32::INFINITY),
                     )
                     .changed()
                 {
                     self.save_config();
                 }
-                for target in self.impersonation_targets.clone() {
+                self.mode = DownloadMode::Custom(self.config.custom_format.clone());
+            }
+            if self.mode != previous_mode {
+                self.config.default_mode = match self.mode {
+                    DownloadMode::Video => "video",
+                    DownloadMode::Audio => "audio",
+                    DownloadMode::Mp3 => "mp3",
+                    DownloadMode::Custom(_) => "custom",
+                }
+                .into();
+                self.save_config();
+            }
+        });
+
+        ui.add_space(14.0);
+        section_frame(ui, "Output folder", |ui| {
+            let folder_response = ui.add(
+                egui::TextEdit::singleline(&mut self.output_dir_text)
+                    .hint_text("/home/user/Downloads")
+                    .desired_width(f32::INFINITY),
+            );
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("Use typed path").clicked() {
+                    self.apply_output_dir();
+                }
+                let browse_label = if self.folder_picker_rx.is_some() {
+                    "Browse… (opening)"
+                } else {
+                    "Browse..."
+                };
+                if ui
+                    .add_enabled(
+                        self.folder_picker_rx.is_none(),
+                        egui::Button::new(browse_label),
+                    )
+                    .clicked()
+                {
+                    self.browse_output_dir();
+                }
+            });
+            if folder_response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
+            {
+                self.apply_output_dir();
+            }
+        });
+
+        ui.add_space(14.0);
+        section_frame(ui, "Cookies browser", |ui| {
+            egui::ComboBox::from_id_salt("cookies-browser")
+                .selected_text(display_none(&self.config.cookies_browser))
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for browser in [
+                        "none", "firefox", "chrome", "chromium", "brave", "edge", "vivaldi",
+                        "safari",
+                    ] {
+                        if ui
+                            .selectable_value(
+                                &mut self.config.cookies_browser,
+                                browser.to_owned(),
+                                display_none(browser),
+                            )
+                            .changed()
+                        {
+                            self.save_config();
+                        }
+                    }
+                });
+        });
+
+        ui.add_space(14.0);
+        section_frame(ui, "Impersonation", |ui| {
+            egui::ComboBox::from_id_salt("impersonation")
+                .selected_text(display_none(&self.config.impersonation))
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
                     if ui
-                        .selectable_value(&mut self.config.impersonation, target.clone(), &target)
+                        .selectable_value(&mut self.config.impersonation, "none".into(), "None")
                         .changed()
                     {
                         self.save_config();
                     }
-                }
-            });
+                    if ui
+                        .selectable_value(
+                            &mut self.config.impersonation,
+                            "any".into(),
+                            "Any available",
+                        )
+                        .changed()
+                    {
+                        self.save_config();
+                    }
+                    for target in self.impersonation_targets.clone() {
+                        if ui
+                            .selectable_value(
+                                &mut self.config.impersonation,
+                                target.clone(),
+                                &target,
+                            )
+                            .changed()
+                        {
+                            self.save_config();
+                        }
+                    }
+                });
+        });
 
-        ui.add_space(18.0);
-        egui::CollapsingHeader::new("Advanced yt-dlp options")
-            .default_open(true)
-            .show(ui, |ui| self.advanced_settings_panel(ui));
+        ui.add_space(14.0);
+        section_frame(ui, "Advanced yt-dlp options", |ui| {
+            self.advanced_settings_panel(ui)
+        });
     }
 
     fn browse_output_dir(&mut self) {
@@ -681,8 +707,35 @@ impl GuiApp {
     }
 
     fn queue_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.heading(format!("Queue ({})", self.queue.len()));
+        section_frame(ui, &format!("Queue ({})", self.queue.len()), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("#").strong().color(Color32::GRAY));
+                ui.add_space(12.0);
+                ui.label(RichText::new("Item").strong().color(Color32::GRAY));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(RichText::new("Progress").strong().color(Color32::GRAY));
+                    ui.add_space(70.0);
+                    ui.label(RichText::new("Status").strong().color(Color32::GRAY));
+                });
+            });
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .max_height(360.0)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if self.queue.is_empty() {
+                        ui.add_space(50.0);
+                        ui.vertical_centered(|ui| {
+                            ui.label(RichText::new("Queue is empty").size(18.0));
+                            ui.label("Add one or more URLs to begin.");
+                        });
+                    }
+                    for (index, item) in self.queue.iter().enumerate() {
+                        queue_row(ui, index, item);
+                        ui.add_space(6.0);
+                    }
+                });
+            ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .add_enabled(
@@ -702,117 +755,76 @@ impl GuiApp {
                 }
             });
         });
-        ui.separator();
-        egui::ScrollArea::vertical()
-            .max_height(390.0)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if self.queue.is_empty() {
-                    ui.add_space(60.0);
-                    ui.vertical_centered(|ui| {
-                        ui.label(RichText::new("Queue is empty").size(18.0));
-                        ui.label("Add one or more URLs to begin.");
-                    });
-                }
-                for (index, item) in self.queue.iter().enumerate() {
-                    egui::Frame::group(ui.style()).show(ui, |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{}", index + 1)).strong());
-                            ui.vertical(|ui| {
-                                ui.label(RichText::new(short_url(&item.url)).strong());
-                                ui.small(&item.url);
-                            });
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        RichText::new(item.state.label())
-                                            .color(state_color(item.state)),
-                                    );
-                                },
-                            );
-                        });
-                        if matches!(
-                            item.state,
-                            DownloadState::Downloading | DownloadState::Finished
-                        ) {
-                            ui.add(
-                                egui::ProgressBar::new(item.progress)
-                                    .desired_width(ui.available_width())
-                                    .show_percentage(),
-                            );
-                            if !item.progress_text.is_empty() {
-                                ui.small(&item.progress_text);
-                            }
-                        }
-                        if let Some(error) = &item.error {
-                            ui.label(RichText::new(error).color(RED));
-                        }
-                    });
-                    ui.add_space(4.0);
-                }
-            });
 
         ui.add_space(10.0);
-        ui.heading(format!(
-            "Active downloads ({}/{})",
-            self.active_downloads.len(),
-            self.config.max_active_downloads.clamp(1, 8)
-        ));
-        if self.active_downloads.is_empty() {
-            ui.label("No active downloads");
-        } else {
-            for index in active_indices(&self.active_downloads) {
-                if let Some(item) = self.queue.get(index) {
-                    ui.label(RichText::new(short_url(&item.url)).strong());
-                    ui.add(
-                        egui::ProgressBar::new(item.progress)
-                            .desired_width(ui.available_width())
-                            .show_percentage(),
-                    );
-                    if !item.progress_text.is_empty() {
-                        ui.small(&item.progress_text);
+        section_frame(
+            ui,
+            &format!(
+                "Now downloading ({}/{})",
+                self.active_downloads.len(),
+                self.config.max_active_downloads.clamp(1, 8)
+            ),
+            |ui| {
+                if let Some(index) = active_indices(&self.active_downloads).into_iter().next() {
+                    if let Some(item) = self.queue.get(index) {
+                        ui.horizontal(|ui| {
+                            thumbnail_placeholder(ui, item);
+                            ui.vertical(|ui| {
+                                ui.label(RichText::new(short_url(&item.url)).strong().size(18.0));
+                                ui.small(&item.url);
+                                ui.add_space(8.0);
+                                ui.add(
+                                    egui::ProgressBar::new(item.progress)
+                                        .desired_width(ui.available_width())
+                                        .show_percentage(),
+                                );
+                                if !item.progress_text.is_empty() {
+                                    ui.small(&item.progress_text);
+                                }
+                            });
+                        });
                     }
-                    ui.add_space(6.0);
+                } else {
+                    ui.label("No active downloads");
                 }
-            }
-        }
 
-        ui.horizontal(|ui| {
-            let start = ui.add_sized(
-                [ui.available_width() * 0.65, 40.0],
-                egui::Button::new(RichText::new("Start queue").strong()).fill(BLUE),
-            );
-            if start.clicked() {
-                self.start_queue();
-            }
-            if ui
-                .add_sized(
-                    [ui.available_width(), 40.0],
-                    egui::Button::new("Cancel active"),
-                )
-                .clicked()
-            {
-                self.cancel();
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    let start = ui.add_sized(
+                        [ui.available_width() * 0.65, 40.0],
+                        egui::Button::new(RichText::new("Start queue").strong()).fill(BLUE),
+                    );
+                    if start.clicked() {
+                        self.start_queue();
+                    }
+                    if ui
+                        .add_sized(
+                            [ui.available_width(), 40.0],
+                            egui::Button::new("Cancel active"),
+                        )
+                        .clicked()
+                    {
+                        self.cancel();
+                    }
+                });
+            },
+        );
+
+        ui.add_space(10.0);
+        section_frame(ui, "Log", |ui| {
+            egui::ScrollArea::vertical()
+                .max_height(130.0)
+                .stick_to_bottom(true)
+                .show(ui, |ui| {
+                    for line in &self.logs {
+                        ui.monospace(line);
+                    }
+                });
+            ui.add_space(8.0);
+            if ui.small_button("Clear log").clicked() {
+                self.logs.clear();
             }
         });
-
-        ui.add_space(10.0);
-        egui::CollapsingHeader::new("Log")
-            .default_open(true)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .max_height(130.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        for line in &self.logs {
-                            ui.monospace(line);
-                        }
-                    });
-                if ui.small_button("Clear log").clicked() {
-                    self.logs.clear();
-                }
-            });
     }
 }
 
@@ -921,11 +933,105 @@ fn configure_style(ctx: &egui::Context) {
     visuals.extreme_bg_color = Color32::from_rgb(23, 27, 31);
     visuals.selection.bg_fill = BLUE;
     visuals.widgets.active.bg_fill = BLUE;
+    visuals.widgets.inactive.bg_fill = PANEL_ALT;
+    visuals.widgets.noninteractive.bg_fill = PANEL_ALT;
     ctx.set_visuals(visuals);
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
     style.spacing.button_padding = egui::vec2(12.0, 8.0);
+    style.visuals.widgets.noninteractive.corner_radius = 8.into();
+    style.visuals.widgets.inactive.corner_radius = 8.into();
+    style.visuals.widgets.active.corner_radius = 8.into();
+    style.visuals.widgets.hovered.corner_radius = 8.into();
     ctx.set_style(style);
+}
+
+fn section_frame(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
+    egui::Frame::group(ui.style())
+        .fill(PANEL)
+        .inner_margin(egui::Margin::same(14))
+        .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
+        .corner_radius(10.0)
+        .show(ui, |ui| {
+            ui.label(RichText::new(title).strong().size(18.0));
+            ui.add_space(10.0);
+            add_contents(ui);
+        });
+}
+
+fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
+    egui::Frame::group(ui.style())
+        .fill(PANEL_ALT)
+        .inner_margin(egui::Margin::same(12))
+        .stroke(egui::Stroke::new(1.0, Color32::from_gray(54)))
+        .corner_radius(10.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(format!("{}", index + 1)).strong());
+                thumbnail_placeholder(ui, item);
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(short_url(&item.url)).strong());
+                    ui.small(&item.url);
+                    if let Some(error) = &item.error {
+                        ui.add_space(4.0);
+                        ui.label(RichText::new(error).color(RED));
+                    }
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if matches!(
+                        item.state,
+                        DownloadState::Downloading | DownloadState::Finished
+                    ) {
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::ProgressBar::new(item.progress)
+                                    .desired_width(150.0)
+                                    .show_percentage(),
+                            );
+                            if !item.progress_text.is_empty() {
+                                ui.small(&item.progress_text);
+                            }
+                        });
+                    } else {
+                        ui.add_space(150.0);
+                    }
+                    status_badge(ui, item.state);
+                });
+            });
+        });
+}
+
+fn thumbnail_placeholder(ui: &mut egui::Ui, item: &GuiQueueItem) {
+    let tint = match item.state {
+        DownloadState::Downloading => BLUE,
+        DownloadState::Finished => GREEN,
+        DownloadState::Failed | DownloadState::Cancelled => RED,
+        DownloadState::Waiting => AMBER,
+    };
+    egui::Frame::group(ui.style())
+        .fill(Color32::from_black_alpha(24))
+        .stroke(egui::Stroke::new(1.0, tint))
+        .corner_radius(8.0)
+        .inner_margin(egui::Margin::same(6))
+        .show(ui, |ui| {
+            ui.allocate_ui(egui::vec2(70.0, 44.0), |ui| {
+                ui.centered_and_justified(|ui| {
+                    ui.label(RichText::new("▶").color(tint).size(20.0));
+                });
+            });
+        });
+}
+
+fn status_badge(ui: &mut egui::Ui, state: DownloadState) {
+    let color = state_color(state);
+    egui::Frame::new()
+        .fill(color.gamma_multiply(0.14))
+        .stroke(egui::Stroke::new(1.0, color))
+        .corner_radius(999.0)
+        .inner_margin(egui::Margin::symmetric(10, 4))
+        .show(ui, |ui| {
+            ui.label(RichText::new(state.label()).color(color).strong());
+        });
 }
 
 fn active_indices(active_downloads: &HashMap<usize, oneshot::Sender<()>>) -> Vec<usize> {
@@ -939,8 +1045,19 @@ fn state_color(state: DownloadState) -> Color32 {
         DownloadState::Downloading => BLUE,
         DownloadState::Finished => GREEN,
         DownloadState::Failed | DownloadState::Cancelled => RED,
-        DownloadState::Waiting => Color32::LIGHT_GRAY,
+        DownloadState::Waiting => AMBER,
     }
+}
+
+fn friendly_error(url: &str, message: &str) -> String {
+    if (url.contains("youtube.com") || url.contains("youtu.be"))
+        && (message.contains("Video unavailable") || message.contains("HTTP Error 403"))
+    {
+        return format!(
+            "{message}. If the video plays in your browser, select a Cookies browser in the left panel and retry."
+        );
+    }
+    message.to_owned()
 }
 
 fn display_none(value: &str) -> &str {
