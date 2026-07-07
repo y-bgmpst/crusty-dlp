@@ -1,5 +1,6 @@
 """yt-dlp extractors for public PMVHaven pages."""
 
+import json
 import re
 
 from yt_dlp.extractor.common import InfoExtractor
@@ -46,6 +47,28 @@ class PMVHavenPlaylistIE(InfoExtractor):
         webpage = self._download_webpage(url, playlist_id, impersonate=True)
 
         entries = []
+        json_ld_matches = re.findall(
+            r'<script type="application/ld\+json">([^<]+)</script>',
+            webpage,
+        )
+        for block in json_ld_matches:
+            try:
+                data = json.loads(block)
+            except json.JSONDecodeError:
+                continue
+            if data.get("@type") != "ItemList":
+                continue
+            for item in data.get("itemListElement", []):
+                video = item.get("item") or {}
+                embed_url = video.get("embedUrl")
+                if embed_url and re.match(r"https?://(?:www\.)?pmvhaven\.com/videos?/", embed_url):
+                    entries.append(
+                        self.url_result(
+                            embed_url,
+                            ie=PMVHavenIE.ie_key(),
+                        )
+                    )
+
         for path in orderedSet(
             re.findall(r'href=["\'](/videos?/[^"\']+)["\']', webpage)
         ):
@@ -55,6 +78,8 @@ class PMVHavenPlaylistIE(InfoExtractor):
                     ie=PMVHavenIE.ie_key(),
                 )
             )
+
+        entries = orderedSet(entries)
 
         if not entries:
             raise ExtractorError("Could not find any playlist entries", expected=True)

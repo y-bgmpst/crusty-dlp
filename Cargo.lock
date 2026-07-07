@@ -730,6 +730,7 @@ name = "crusty-dlp"
 version = "0.5.0"
 dependencies = [
  "anyhow",
+ "arboard",
  "clap",
  "crossterm 0.28.1",
  "directories",

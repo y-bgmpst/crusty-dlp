@@ -42,7 +42,7 @@ impl Default for Config {
             use_aria2: false,
             rate_limit: String::new(),
             max_active_downloads: 1,
-            allow_playlists: false,
+            allow_playlists: true,
             search_platform: "youtube".into(),
         }
     }
@@ -98,7 +98,7 @@ mod tests {
         assert_eq!(config.default_mode, "video");
         assert_eq!(config.rate_limit, "");
         assert_eq!(config.max_active_downloads, 1);
-        assert!(!config.allow_playlists);
+        assert!(config.allow_playlists);
         assert_eq!(config.search_platform, "youtube");
     }
 

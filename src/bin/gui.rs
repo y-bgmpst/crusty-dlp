@@ -5,13 +5,15 @@ use std::{
     time::Duration,
 };
 
+use arboard::Clipboard;
 use crusty_dlp::{
     app::{validate_url, DownloadMode, DownloadState},
     config::Config,
     downloader::{
-        available_impersonation_targets, dependency_path, expand_playlist_urls,
-        supports_playlist_expansion, validate_output_template, validate_rate_limit, DownloadEvent,
-        DownloadOptions, Downloader,
+        available_impersonation_targets, current_executable_path, dependency_path,
+        expand_playlist_urls, resolved_plugin_directory, supports_playlist_expansion,
+        validate_output_template, validate_rate_limit, DownloadEvent, DownloadOptions, Downloader,
+        PlaylistEntry,
     },
     search::{open_platform_search, SearchPlatform},
 };
@@ -24,17 +26,24 @@ const RED: Color32 = Color32::from_rgb(235, 87, 87);
 const AMBER: Color32 = Color32::from_rgb(217, 154, 34);
 const PANEL: Color32 = Color32::from_rgb(31, 36, 41);
 const PANEL_ALT: Color32 = Color32::from_rgb(36, 42, 48);
+const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_PROFILE: &str = if cfg!(debug_assertions) {
+    "debug"
+} else {
+    "release"
+};
 
 fn main() -> eframe::Result {
+    let app_title = format!("crusty-dlp v{APP_VERSION}");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("crusty-dlp")
+            .with_title(&app_title)
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([960.0, 660.0]),
         ..Default::default()
     };
     eframe::run_native(
-        "crusty-dlp",
+        &app_title,
         options,
         Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
     )
@@ -42,6 +51,7 @@ fn main() -> eframe::Result {
 
 #[derive(Debug)]
 struct GuiQueueItem {
+    title: Option<String>,
     url: String,
     state: DownloadState,
     progress: f32,
@@ -175,6 +185,23 @@ impl GuiApp {
         }
     }
 
+    fn paste_input_from_clipboard(&mut self) {
+        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+            Ok(text) => {
+                let trimmed = text.trim();
+                if trimmed.is_empty() {
+                    self.status = "Clipboard is empty".into();
+                } else {
+                    self.input = trimmed.to_owned();
+                    self.status = "Pasted URL(s) from clipboard".into();
+                }
+            }
+            Err(error) => {
+                self.status = format!("Could not read clipboard: {error}");
+            }
+        }
+    }
+
     fn expand_or_enqueue(&mut self, url: &str) -> Result<usize, String> {
         validate_url(url).map_err(|error| error.to_string())?;
         if self.config.allow_playlists && supports_playlist_expansion(url) {
@@ -183,17 +210,25 @@ impl GuiApp {
             })?;
             match expand_playlist_urls(&yt_dlp, url) {
                 Ok(Some(entries)) => {
-                    for entry in &entries {
-                        self.enqueue_url(entry);
-                    }
                     self.log(format!(
-                        "Expanded playlist into {} item(s): {url}",
+                        "Playlist expansion found {} item(s): {url}",
                         entries.len()
                     ));
+                    for entry in &entries {
+                        self.enqueue_playlist_entry(entry);
+                    }
+                    self.status = format!("Expanded playlist into {} item(s)", entries.len());
                     return Ok(entries.len());
                 }
-                Ok(None) => {}
-                Err(error) => return Err(error),
+                Ok(None) => {
+                    return Err(format!(
+                        "playlist expansion returned no entries for supported URL: {url}"
+                    ));
+                }
+                Err(error) => {
+                    self.log(format!("Playlist expansion failed: {error}"));
+                    return Err(error);
+                }
             }
         }
         self.enqueue_url(url);
@@ -201,8 +236,17 @@ impl GuiApp {
     }
 
     fn enqueue_url(&mut self, url: &str) {
+        self.enqueue_queue_item(None, url);
+    }
+
+    fn enqueue_playlist_entry(&mut self, entry: &PlaylistEntry) {
+        self.enqueue_queue_item(entry.title.clone(), &entry.url);
+    }
+
+    fn enqueue_queue_item(&mut self, title: Option<String>, url: &str) {
         self.log(format!("Added to queue: {url}"));
         self.queue.push(GuiQueueItem {
+            title,
             url: url.to_owned(),
             state: DownloadState::Waiting,
             progress: 0.0,
@@ -495,11 +539,19 @@ impl GuiApp {
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "URL", |ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.input)
-                    .hint_text("https://example.com/video")
-                    .desired_width(f32::INFINITY),
-            );
+            let response = ui
+                .horizontal(|ui| {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(&mut self.input)
+                            .hint_text("https://example.com/video")
+                            .desired_width((ui.available_width() - 78.0).max(120.0)),
+                    );
+                    if ui.button("Paste").clicked() {
+                        self.paste_input_from_clipboard();
+                    }
+                    response
+                })
+                .inner;
             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 self.add_input();
             }
@@ -896,8 +948,9 @@ impl GuiApp {
                 }
             });
         });
+    }
 
-        ui.add_space(10.0);
+    fn queue_controls_panel(&mut self, ui: &mut egui::Ui) {
         section_frame(
             ui,
             &format!(
@@ -913,7 +966,7 @@ impl GuiApp {
                             ui.vertical(|ui| {
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(short_url(&item.url)).strong().size(18.0),
+                                        RichText::new(queue_item_title(item)).strong().size(18.0),
                                     )
                                     .truncate(),
                                 );
@@ -1001,15 +1054,19 @@ impl GuiApp {
                 });
             },
         );
+    }
 
-        ui.add_space(10.0);
+    fn queue_log_panel(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Log", |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(130.0)
+            egui::ScrollArea::both()
                 .stick_to_bottom(true)
+                .auto_shrink([false, false])
                 .show(ui, |ui| {
                     for line in &self.logs {
-                        ui.monospace(line);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(line).monospace())
+                                .selectable(true),
+                        );
                     }
                 });
             ui.add_space(8.0);
@@ -1025,7 +1082,7 @@ impl eframe::App for GuiApp {
         self.process_events();
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading(RichText::new("crusty-dlp").strong());
+                ui.heading(RichText::new(format!("crusty-dlp v{APP_VERSION}")).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add(
                         egui::Label::new(RichText::new(&self.status).color(Color32::LIGHT_GRAY))
@@ -1046,22 +1103,49 @@ impl eframe::App for GuiApp {
                         egui::ScrollArea::vertical().show(ui, |ui| self.settings_panel(ui));
                     });
             });
-        egui::CentralPanel::default().show(ctx, |ui| self.queue_panel(ui));
+        egui::CentralPanel::default().show(ctx, |ui| {
+            egui::TopBottomPanel::bottom("queue_log_panel")
+                .resizable(false)
+                .exact_height(240.0)
+                .show_inside(ui, |ui| self.queue_log_panel(ui));
+            egui::TopBottomPanel::bottom("queue_controls_panel")
+                .resizable(false)
+                .exact_height(220.0)
+                .show_inside(ui, |ui| self.queue_controls_panel(ui));
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| self.queue_panel(ui));
+        });
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let yt_dlp = dependency_path("yt-dlp")
-                    .map(|path| path.display().to_string())
-                    .unwrap_or_else(|| "not found".into());
-                ui.label(format!("yt-dlp: {yt_dlp}"));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let waiting = self
-                        .queue
-                        .iter()
-                        .filter(|item| item.state == DownloadState::Waiting)
-                        .count();
-                    ui.label(format!("{waiting} queued"));
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    let executable = current_executable_path()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "not found".into());
+                    let plugin_dir = resolved_plugin_directory()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "not found".into());
+                    ui.label(format!("exe: {executable}"));
                     ui.separator();
-                    ui.label(format!("{} active", self.active_downloads.len()));
+                    ui.label(format!("plugins: {plugin_dir}"));
+                });
+                ui.horizontal(|ui| {
+                    let yt_dlp = dependency_path("yt-dlp")
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "not found".into());
+                    ui.label(format!("yt-dlp: {yt_dlp}"));
+                    ui.separator();
+                    ui.label(format!("crusty-dlp v{APP_VERSION} ({BUILD_PROFILE})"));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let waiting = self
+                            .queue
+                            .iter()
+                            .filter(|item| item.state == DownloadState::Waiting)
+                            .count();
+                        ui.label(format!("{waiting} queued"));
+                        ui.separator();
+                        ui.label(format!("{} active", self.active_downloads.len()));
+                    });
                 });
             });
         });
@@ -1191,7 +1275,7 @@ fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| {
                         ui.add(
-                            egui::Label::new(RichText::new(short_url(&item.url)).strong())
+                            egui::Label::new(RichText::new(queue_item_title(item)).strong())
                                 .truncate(),
                         );
                         ui.add(
@@ -1328,4 +1412,11 @@ fn short_url(url: &str) -> &str {
     url.split_once("://")
         .map(|(_, remainder)| remainder)
         .unwrap_or(url)
+}
+
+fn queue_item_title(item: &GuiQueueItem) -> &str {
+    item.title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or_else(|| short_url(&item.url))
 }

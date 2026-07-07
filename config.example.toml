@@ -16,6 +16,6 @@ rate_limit = ""
 # Number of simultaneous downloads in the GUI.
 max_active_downloads = 1
 # Expand supported playlist URLs such as YouTube playlists.
-allow_playlists = false
+allow_playlists = true
 # Browser search launcher default platform.
 search_platform = "youtube"

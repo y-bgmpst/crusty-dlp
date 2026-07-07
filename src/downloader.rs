@@ -1,9 +1,11 @@
 use std::{
+    collections::HashSet,
     ffi::OsString,
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
 };
 
+use directories::ProjectDirs;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command as TokioCommand,
@@ -26,6 +28,12 @@ pub struct Downloader {
     executable: PathBuf,
     output_dir: PathBuf,
     plugin_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaylistEntry {
+    pub title: Option<String>,
+    pub url: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,16 +220,27 @@ impl Downloader {
 fn plugin_directory() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
     let directory = executable.parent()?;
+    let current_directory = std::env::current_dir().ok();
+    let user_data_directory = ProjectDirs::from("org", "crusty-dlp", "crusty-dlp")
+        .map(|dirs| dirs.data_local_dir().to_path_buf());
     #[cfg(unix)]
     let system_directory = Some(PathBuf::from("/usr/share/crusty-dlp"));
     #[cfg(not(unix))]
     let system_directory: Option<PathBuf> = None;
-    directory
-        .ancestors()
-        .take(5)
-        .map(Path::to_owned)
+    current_directory
+        .into_iter()
+        .chain(directory.ancestors().take(5).map(Path::to_owned))
+        .chain(user_data_directory)
         .chain(system_directory)
         .find(|path| path.join("plugins/yt_dlp_plugins/extractor").is_dir())
+}
+
+pub fn resolved_plugin_directory() -> Option<PathBuf> {
+    plugin_directory()
+}
+
+pub fn current_executable_path() -> Option<PathBuf> {
+    std::env::current_exe().ok()
 }
 
 /// Ask yt-dlp itself which impersonation targets are usable. This avoids
@@ -298,18 +317,24 @@ pub fn supports_playlist_expansion(url: &str) -> bool {
     is_youtube_playlist_url(url) || is_pmvhaven_playlist_url(url) || is_spankbang_playlist_url(url)
 }
 
-pub fn expand_playlist_urls(executable: &Path, url: &str) -> Result<Option<Vec<String>>, String> {
+pub fn expand_playlist_urls(
+    executable: &Path,
+    url: &str,
+) -> Result<Option<Vec<PlaylistEntry>>, String> {
     if !supports_playlist_expansion(url) {
         return Ok(None);
     }
 
-    let output = StdCommand::new(executable)
-        .args([
-            "--flat-playlist",
-            "--print",
-            "%(id)s\t%(webpage_url)s\t%(url)s",
-            "--",
-        ])
+    if is_pmvhaven_playlist_url(url) {
+        return expand_pmvhaven_playlist_urls(url);
+    }
+
+    let mut command = StdCommand::new(executable);
+    command.args(playlist_probe_arguments());
+    if let Some(plugin_dir) = plugin_directory() {
+        command.arg("--plugin-dirs").arg(plugin_dir);
+    }
+    let output = command
         .arg(url)
         .output()
         .map_err(|error| format!("could not inspect playlist: {error}"))?;
@@ -324,14 +349,123 @@ pub fn expand_playlist_urls(executable: &Path, url: &str) -> Result<Option<Vec<S
     }
 
     let source = playlist_source(url);
-    let entries = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .filter_map(|line| parse_flat_playlist_line(line, source))
-        .collect::<Vec<_>>();
+    let entries = dedupe_playlist_entries(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| parse_flat_playlist_line(line, source))
+            .collect::<Vec<_>>(),
+    );
     if entries.is_empty() {
-        return Ok(None);
+        return Err(format!("playlist inspection found 0 entries for {url}"));
     }
     Ok(Some(entries))
+}
+
+fn playlist_probe_arguments() -> [&'static str; 4] {
+    [
+        "--flat-playlist",
+        "--print",
+        "%(title)s\t%(id)s\t%(webpage_url)s\t%(url)s",
+        "--",
+    ]
+}
+
+fn expand_pmvhaven_playlist_urls(url: &str) -> Result<Option<Vec<PlaylistEntry>>, String> {
+    let output = StdCommand::new("curl")
+        .args(["-fsSL", "--"])
+        .arg(url)
+        .output()
+        .map_err(|error| format!("could not inspect PMVHaven playlist: {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let message = stderr
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("curl could not inspect the PMVHaven playlist");
+        return Err(message.to_owned());
+    }
+
+    let html = String::from_utf8_lossy(&output.stdout);
+    let entries = dedupe_playlist_entries(parse_pmvhaven_itemlist_entries(&html));
+    if entries.is_empty() {
+        return Err(format!(
+            "PMVHaven playlist parser found 0 entries for {url}"
+        ));
+    }
+    Ok(Some(entries))
+}
+
+fn parse_pmvhaven_itemlist_entries(html: &str) -> Vec<PlaylistEntry> {
+    let mut entries = Vec::new();
+    let name_key = r#""name":"#;
+    let embed_key = r#""embedUrl":"#;
+    let Some(list_start) = html.find(r#""itemListElement""#) else {
+        return entries;
+    };
+    let mut cursor = &html[list_start..];
+
+    while let Some((before_embed, after_embed)) = cursor.split_once(embed_key) {
+        let Some((embed_url_raw, rest)) = after_embed.split_once('"') else {
+            break;
+        };
+        let title = before_embed
+            .rsplit(name_key)
+            .next()
+            .and_then(|fragment| fragment.split_once('"').map(|(value, _)| value.to_owned()));
+        let embed_url = decode_json_escapes(&embed_url_raw);
+        if embed_url.starts_with("http://") || embed_url.starts_with("https://") {
+            entries.push(PlaylistEntry {
+                title: title.map(|value| decode_json_escapes(&value)),
+                url: embed_url,
+            });
+        }
+        cursor = rest;
+    }
+    entries
+}
+
+fn decode_json_escapes(value: &str) -> String {
+    let mut output = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('"') => output.push('"'),
+            Some('\\') => output.push('\\'),
+            Some('/') => output.push('/'),
+            Some('b') => output.push('\u{0008}'),
+            Some('f') => output.push('\u{000C}'),
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('t') => output.push('\t'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if let Ok(codepoint) = u32::from_str_radix(&hex, 16) {
+                    if let Some(decoded) = char::from_u32(codepoint) {
+                        output.push(decoded);
+                    }
+                }
+            }
+            Some(other) => output.push(other),
+            None => break,
+        }
+    }
+    output
+}
+
+fn dedupe_playlist_entries(entries: Vec<PlaylistEntry>) -> Vec<PlaylistEntry> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::new();
+    for entry in entries {
+        if seen.insert(entry.url.clone()) {
+            deduped.push(entry);
+        }
+    }
+    deduped
 }
 
 pub fn validate_output_template(template: &str) -> Result<(), String> {
@@ -427,8 +561,9 @@ fn url_host_matches(value: &str, expected: &str) -> bool {
     host == expected || host.ends_with(&format!(".{expected}"))
 }
 
-fn parse_flat_playlist_line(line: &str, source: PlaylistSource) -> Option<String> {
-    let mut fields = line.splitn(3, '\t');
+fn parse_flat_playlist_line(line: &str, source: PlaylistSource) -> Option<PlaylistEntry> {
+    let mut fields = line.splitn(4, '\t');
+    let title = fields.next().and_then(non_empty_trimmed).map(str::to_owned);
     let id = fields.next().and_then(non_empty_trimmed);
     let webpage_url = fields.next().and_then(non_empty_trimmed);
     let media_url = fields.next().and_then(non_empty_trimmed);
@@ -442,6 +577,7 @@ fn parse_flat_playlist_line(line: &str, source: PlaylistSource) -> Option<String
                 .map(str::to_owned)
         })
         .or_else(|| fallback_playlist_entry_url(source, id))
+        .map(|url| PlaylistEntry { title, url })
 }
 
 fn non_empty_trimmed(value: &str) -> Option<&str> {
@@ -672,9 +808,9 @@ mod tests {
     #[test]
     fn parses_flat_playlist_entries() {
         let urls = [
-            "abc123\thttps://www.youtube.com/watch?v=abc123\tabc123",
-            "def456\t\tdef456",
-            "ghi789\t\thttps://spankbang.com/ghi789/video/ghi789",
+            "Title A\tabc123\thttps://www.youtube.com/watch?v=abc123\tabc123",
+            "Title B\tdef456\t\tdef456",
+            "Title C\tghi789\t\thttps://spankbang.com/ghi789/video/ghi789",
         ]
         .into_iter()
         .filter_map(|line| parse_flat_playlist_line(line, PlaylistSource::YouTube))
@@ -682,9 +818,18 @@ mod tests {
         assert_eq!(
             urls,
             vec![
-                "https://www.youtube.com/watch?v=abc123",
-                "https://www.youtube.com/watch?v=def456",
-                "https://spankbang.com/ghi789/video/ghi789",
+                PlaylistEntry {
+                    title: Some("Title A".into()),
+                    url: "https://www.youtube.com/watch?v=abc123".into(),
+                },
+                PlaylistEntry {
+                    title: Some("Title B".into()),
+                    url: "https://www.youtube.com/watch?v=def456".into(),
+                },
+                PlaylistEntry {
+                    title: Some("Title C".into()),
+                    url: "https://spankbang.com/ghi789/video/ghi789".into(),
+                },
             ]
         );
     }
@@ -692,12 +837,72 @@ mod tests {
     #[test]
     fn falls_back_to_site_specific_playlist_urls() {
         assert_eq!(
-            parse_flat_playlist_line("pmv001\t\t", PlaylistSource::PmvHaven),
-            Some("https://pmvhaven.com/video/pmv001".into())
+            parse_flat_playlist_line("Title X\tpmv001\t\t", PlaylistSource::PmvHaven),
+            Some(PlaylistEntry {
+                title: Some("Title X".into()),
+                url: "https://pmvhaven.com/video/pmv001".into(),
+            })
         );
         assert_eq!(
-            parse_flat_playlist_line("sb001\t\t", PlaylistSource::SpankBang),
-            Some("https://spankbang.com/sb001/video/sb001".into())
+            parse_flat_playlist_line("Title Y\tsb001\t\t", PlaylistSource::SpankBang),
+            Some(PlaylistEntry {
+                title: Some("Title Y".into()),
+                url: "https://spankbang.com/sb001/video/sb001".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn playlist_probe_arguments_are_stable() {
+        assert_eq!(
+            playlist_probe_arguments(),
+            [
+                "--flat-playlist",
+                "--print",
+                "%(title)s\t%(id)s\t%(webpage_url)s\t%(url)s",
+                "--"
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_pmvhaven_embed_urls() {
+        assert_eq!(
+            decode_json_escapes(
+                r#"https:\u002F\u002Fpmvhaven.com\u002Fvideos\u002F68f99987828ec8d0de64bb98"#
+            ),
+            "https://pmvhaven.com/videos/68f99987828ec8d0de64bb98"
+        );
+    }
+
+    #[test]
+    fn dedupes_playlist_entries_by_url() {
+        let entries = vec![
+            PlaylistEntry {
+                title: Some("First".into()),
+                url: "https://example.com/a".into(),
+            },
+            PlaylistEntry {
+                title: Some("Duplicate".into()),
+                url: "https://example.com/a".into(),
+            },
+            PlaylistEntry {
+                title: Some("Second".into()),
+                url: "https://example.com/b".into(),
+            },
+        ];
+        assert_eq!(
+            dedupe_playlist_entries(entries),
+            vec![
+                PlaylistEntry {
+                    title: Some("First".into()),
+                    url: "https://example.com/a".into(),
+                },
+                PlaylistEntry {
+                    title: Some("Second".into()),
+                    url: "https://example.com/b".into(),
+                },
+            ]
         );
     }
 }
