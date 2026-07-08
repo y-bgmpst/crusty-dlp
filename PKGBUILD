@@ -1,6 +1,6 @@
 # Maintainer: crusty-dlp contributors
 pkgname=crusty-dlp
-pkgver=0.6.0
+pkgver=0.6.1
 pkgrel=2
 pkgdesc='Safe terminal and desktop interfaces for yt-dlp download queues'
 arch=('x86_64' 'aarch64')
