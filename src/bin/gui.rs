@@ -2,7 +2,10 @@ use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
     path::PathBuf,
-    sync::mpsc::{self as std_mpsc, Receiver, TryRecvError},
+    sync::{
+        mpsc::{self as std_mpsc, Receiver, TryRecvError},
+        Arc, Mutex,
+    },
     time::Duration,
 };
 
@@ -47,6 +50,45 @@ const BUILD_PROFILE: &str = if cfg!(debug_assertions) {
 } else {
     "release"
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GuiTheme {
+    Graphite,
+    Midnight,
+    Oled,
+    Warm,
+}
+
+impl GuiTheme {
+    const ALL: [Self; 4] = [Self::Graphite, Self::Midnight, Self::Oled, Self::Warm];
+
+    fn from_config(value: &str) -> Self {
+        match value {
+            "midnight" => Self::Midnight,
+            "oled" => Self::Oled,
+            "warm" => Self::Warm,
+            _ => Self::Graphite,
+        }
+    }
+
+    fn config_value(self) -> &'static str {
+        match self {
+            Self::Graphite => "graphite",
+            Self::Midnight => "midnight",
+            Self::Oled => "oled",
+            Self::Warm => "warm",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Graphite => "Graphite",
+            Self::Midnight => "Midnight",
+            Self::Oled => "OLED",
+            Self::Warm => "Warm Slate",
+        }
+    }
+}
 
 fn main() -> eframe::Result {
     let app_title = format!("crusty-dlp v{APP_VERSION}");
@@ -125,6 +167,11 @@ struct QueueThumbnailEvent {
     result: Result<DecodedThumbnail, String>,
 }
 
+struct ThumbnailRequest {
+    index: usize,
+    url: String,
+}
+
 struct DecodedThumbnail {
     rgba: Vec<u8>,
     width: usize,
@@ -153,17 +200,17 @@ struct GuiApp {
     status: String,
     folder_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
     thumbnail_rx: Receiver<QueueThumbnailEvent>,
-    thumbnail_tx: std_mpsc::Sender<QueueThumbnailEvent>,
+    thumbnail_request_tx: std_mpsc::Sender<ThumbnailRequest>,
 }
 
 impl GuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        configure_style(&cc.egui_ctx);
         let config_path = Config::path().ok();
         let config = config_path
             .as_deref()
             .and_then(|path| Config::load(path).ok())
             .unwrap_or_default();
+        configure_style(&cc.egui_ctx, &config);
         let mode = match config.default_mode.as_str() {
             "audio" => DownloadMode::Audio,
             "mp3" => DownloadMode::Mp3,
@@ -177,6 +224,26 @@ impl GuiApp {
             .unwrap_or_default();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (thumbnail_tx, thumbnail_rx) = std_mpsc::channel();
+        let (thumbnail_request_tx, thumbnail_request_rx) = std_mpsc::channel::<ThumbnailRequest>();
+        let thumbnail_request_rx = Arc::new(Mutex::new(thumbnail_request_rx));
+        for _ in 0..4 {
+            let request_rx = Arc::clone(&thumbnail_request_rx);
+            let result_tx = thumbnail_tx.clone();
+            std::thread::spawn(move || loop {
+                let request = match request_rx.lock() {
+                    Ok(receiver) => receiver.recv(),
+                    Err(_) => break,
+                };
+                let Ok(request) = request else {
+                    break;
+                };
+                let result = download_thumbnail(&request.url);
+                let _ = result_tx.send(QueueThumbnailEvent {
+                    index: request.index,
+                    result,
+                });
+            });
+        }
         let status = if yt_dlp.is_some() {
             "Ready".to_owned()
         } else {
@@ -204,7 +271,7 @@ impl GuiApp {
             status,
             folder_picker_rx: None,
             thumbnail_rx,
-            thumbnail_tx,
+            thumbnail_request_tx,
         }
     }
 
@@ -214,6 +281,15 @@ impl GuiApp {
                 self.status = error.to_string();
             }
         }
+    }
+
+    fn current_theme(&self) -> GuiTheme {
+        GuiTheme::from_config(&self.config.gui_theme)
+    }
+
+    fn set_theme(&mut self, theme: GuiTheme) {
+        self.config.gui_theme = theme.config_value().into();
+        self.save_config();
     }
 
     fn search_platform(&self) -> SearchPlatform {
@@ -263,7 +339,7 @@ impl GuiApp {
     }
 
     fn paste_input_from_clipboard(&mut self) {
-        match Clipboard::new().and_then(|mut clipboard| clipboard.get_text()) {
+        match read_clipboard_text() {
             Ok(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
@@ -273,9 +349,7 @@ impl GuiApp {
                     self.status = "Pasted URL(s) from clipboard".into();
                 }
             }
-            Err(error) => {
-                self.status = format!("Could not read clipboard: {error}");
-            }
+            Err(error) => self.status = error,
         }
     }
 
@@ -364,10 +438,9 @@ impl GuiApp {
         let Some(thumbnail_url) = item.thumbnail_url.clone() else {
             return;
         };
-        let tx = self.thumbnail_tx.clone();
-        std::thread::spawn(move || {
-            let result = download_thumbnail(&thumbnail_url);
-            let _ = tx.send(QueueThumbnailEvent { index, result });
+        let _ = self.thumbnail_request_tx.send(ThumbnailRequest {
+            index,
+            url: thumbnail_url,
         });
     }
 
@@ -724,6 +797,7 @@ impl GuiApp {
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "URL", |ui| {
+            let mut paste_clicked = false;
             let response = ui
                 .horizontal(|ui| {
                     let response = text_edit_with_context_menu(
@@ -732,12 +806,15 @@ impl GuiApp {
                         "https://example.com/video",
                         (ui.available_width() - 78.0).max(120.0),
                     );
-                    if ui.button("Paste").clicked() {
-                        self.paste_input_from_clipboard();
-                    }
+                    paste_clicked = ui.button("Paste").clicked();
                     response
                 })
                 .inner;
+            if paste_clicked {
+                self.paste_input_from_clipboard();
+                response.request_focus();
+                ui.ctx().request_repaint();
+            }
             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
                 self.add_input();
             }
@@ -751,6 +828,38 @@ impl GuiApp {
             {
                 self.add_input();
             }
+        });
+
+        ui.add_space(14.0);
+        section_frame(ui, "Appearance", |ui| {
+            egui::ComboBox::from_id_salt("gui-theme")
+                .selected_text(self.current_theme().label())
+                .width(ui.available_width())
+                .show_ui(ui, |ui| {
+                    for theme in GuiTheme::ALL {
+                        if ui
+                            .selectable_label(self.current_theme() == theme, theme.label())
+                            .clicked()
+                        {
+                            self.set_theme(theme);
+                        }
+                    }
+                });
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Opacity");
+                if ui
+                    .add(
+                        egui::Slider::new(&mut self.config.gui_opacity, 0.70..=1.0)
+                            .show_value(true),
+                    )
+                    .changed()
+                {
+                    self.config.gui_opacity = self.config.gui_opacity.clamp(0.70, 1.0);
+                    self.save_config();
+                }
+            });
+            ui.small("Theme changes apply live. Lower opacity softens panel chrome.");
         });
 
         ui.add_space(14.0);
@@ -1360,6 +1469,7 @@ impl GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        configure_style(ctx, &self.config);
         self.process_events();
         self.ensure_thumbnail_textures(ctx);
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
@@ -1515,15 +1625,44 @@ impl OwnedDownloadOptions {
     }
 }
 
-fn configure_style(ctx: &egui::Context) {
+fn configure_style(ctx: &egui::Context, config: &Config) {
+    let opacity = config.gui_opacity.clamp(0.70, 1.0);
+    let theme = GuiTheme::from_config(&config.gui_theme);
+    let (panel_fill, window_fill, extreme_bg, accent) = match theme {
+        GuiTheme::Graphite => (
+            rgba(28, 32, 36, opacity),
+            rgba(31, 36, 41, opacity),
+            rgba(23, 27, 31, opacity),
+            BLUE,
+        ),
+        GuiTheme::Midnight => (
+            rgba(18, 25, 34, opacity),
+            rgba(23, 31, 43, opacity),
+            rgba(12, 17, 25, opacity),
+            Color32::from_rgb(72, 149, 239),
+        ),
+        GuiTheme::Oled => (
+            rgba(10, 10, 12, opacity),
+            rgba(14, 14, 16, opacity),
+            rgba(5, 5, 7, opacity),
+            Color32::from_rgb(76, 161, 255),
+        ),
+        GuiTheme::Warm => (
+            rgba(36, 31, 30, opacity),
+            rgba(42, 36, 34, opacity),
+            rgba(24, 21, 20, opacity),
+            Color32::from_rgb(214, 127, 74),
+        ),
+    };
     let mut visuals = egui::Visuals::dark();
-    visuals.panel_fill = Color32::from_rgb(28, 32, 36);
-    visuals.window_fill = Color32::from_rgb(31, 36, 41);
-    visuals.extreme_bg_color = Color32::from_rgb(23, 27, 31);
-    visuals.selection.bg_fill = BLUE;
-    visuals.widgets.active.bg_fill = BLUE;
-    visuals.widgets.inactive.bg_fill = PANEL_ALT;
-    visuals.widgets.noninteractive.bg_fill = PANEL_ALT;
+    visuals.panel_fill = panel_fill;
+    visuals.window_fill = window_fill;
+    visuals.extreme_bg_color = extreme_bg;
+    visuals.selection.bg_fill = accent;
+    visuals.widgets.active.bg_fill = accent;
+    visuals.widgets.hovered.bg_fill = accent.gamma_multiply(0.85);
+    visuals.widgets.inactive.bg_fill = panel_fill;
+    visuals.widgets.noninteractive.bg_fill = panel_fill;
     ctx.set_visuals(visuals);
     let mut style = (*ctx.style()).clone();
     style.spacing.item_spacing = egui::vec2(8.0, 8.0);
@@ -1533,6 +1672,21 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.widgets.active.corner_radius = 8.into();
     style.visuals.widgets.hovered.corner_radius = 8.into();
     ctx.set_style(style);
+}
+
+fn rgba(red: u8, green: u8, blue: u8, opacity: f32) -> Color32 {
+    Color32::from_rgba_premultiplied(
+        red,
+        green,
+        blue,
+        (255.0 * opacity.clamp(0.0, 1.0)).round() as u8,
+    )
+}
+
+fn read_clipboard_text() -> Result<String, String> {
+    Clipboard::new()
+        .and_then(|mut clipboard| clipboard.get_text())
+        .map_err(|error| format!("Could not read clipboard: {error}"))
 }
 
 fn fill_rounded_rect(
@@ -1662,10 +1816,8 @@ fn text_edit_with_context_menu(
             ui.close_menu();
         }
         if ui.button("Paste").clicked() {
-            if let Ok(mut clipboard) = Clipboard::new() {
-                if let Ok(text) = clipboard.get_text() {
-                    *value = text;
-                }
+            if let Ok(text) = read_clipboard_text() {
+                *value = text;
             }
             ui.close_menu();
         }

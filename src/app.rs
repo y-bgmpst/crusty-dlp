@@ -87,6 +87,7 @@ pub struct App {
     pub message: String,
     pub progress: Option<f64>,
     pub progress_text: String,
+    pub queue_offset: usize,
     pub impersonation_targets: Vec<String>,
     pub show_install_prompt: bool,
     pub aria2_available: bool,
@@ -126,6 +127,7 @@ impl App {
             message: "Ready".into(),
             progress: None,
             progress_text: String::new(),
+            queue_offset: 0,
             impersonation_targets,
             show_install_prompt: false,
             aria2_available,
@@ -156,6 +158,7 @@ impl App {
                     url,
                     state: DownloadState::Waiting,
                 });
+                self.clamp_queue_offset();
                 self.message = if needs_spankbang_session {
                     "SpankBang may require fresh browser cookies; press b to select that browser"
                         .into()
@@ -407,7 +410,9 @@ impl App {
             .queue
             .iter()
             .position(|item| item.state == DownloadState::Waiting)?;
-        self.queue.remove(position)
+        let item = self.queue.remove(position);
+        self.clamp_queue_offset();
+        item
     }
 
     pub fn begin_download(&mut self, mut item: QueueItem) -> oneshot::Receiver<()> {
@@ -424,12 +429,14 @@ impl App {
     pub fn fail_item(&mut self, mut item: QueueItem, message: &str) {
         item.state = DownloadState::Failed;
         self.queue.push_front(item);
+        self.clamp_queue_offset();
         self.message = message.into();
     }
 
     pub fn finish_dry_run(&mut self, mut item: QueueItem, command: String) {
         item.state = DownloadState::Finished;
         self.queue.push_back(item);
+        self.clamp_queue_offset();
         self.message = format!("Dry run: {command}");
         if self
             .queue
@@ -470,6 +477,7 @@ impl App {
             item.state = state;
             self.queue.push_back(item);
         }
+        self.clamp_queue_offset();
         self.cancel_tx = None;
         self.message = message.into();
         if state == DownloadState::Finished
@@ -480,6 +488,20 @@ impl App {
         {
             self.start_requested = true;
         }
+    }
+
+    pub fn scroll_queue(&mut self, delta: isize) {
+        if delta < 0 {
+            self.queue_offset = self.queue_offset.saturating_sub(delta.unsigned_abs());
+        } else {
+            self.queue_offset = self.queue_offset.saturating_add(delta as usize);
+        }
+        self.clamp_queue_offset();
+    }
+
+    fn clamp_queue_offset(&mut self) {
+        let total = self.queue.len() + usize::from(self.current.is_some());
+        self.queue_offset = self.queue_offset.min(total.saturating_sub(1));
     }
 }
 

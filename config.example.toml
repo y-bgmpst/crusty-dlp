@@ -25,3 +25,7 @@ max_active_downloads = 1
 allow_playlists = true
 # Browser search launcher default platform.
 search_platform = "youtube"
+# GUI theme: graphite, midnight, oled, warm
+gui_theme = "graphite"
+# GUI chrome opacity from 0.70 to 1.00
+gui_opacity = 0.96

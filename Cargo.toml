@@ -1,6 +1,6 @@
 [package]
 name = "crusty-dlp"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 description = "Safe terminal and desktop interfaces for yt-dlp"
@@ -40,3 +40,69 @@ tempfile = "3.15"
 codegen-units = 1
 lto = "thin"
 strip = true
+
+[package.metadata.deb]
+name = "crusty-dlp"
+maintainer = "crusty-dlp contributors"
+copyright = "2026, crusty-dlp contributors"
+license-file = ["LICENSE", "0"]
+extended-description-file = "README.md"
+section = "video"
+priority = "optional"
+depends = "$auto, yt-dlp"
+recommends = "ffmpeg"
+suggests = "python3-curl-cffi, deno, aria2"
+maintainer-scripts = "packaging/debian"
+assets = [
+  ["target/release/crusty-dlp", "usr/bin/crusty-dlp", "755"],
+  ["target/release/crusty-dlp-gui", "usr/bin/crusty-dlp-gui", "755"],
+  ["assets/crusty-dlp.desktop", "usr/share/applications/crusty-dlp.desktop", "644"],
+  ["assets/crusty-dlp.svg", "usr/share/icons/hicolor/scalable/apps/crusty-dlp.svg", "644"],
+  ["assets/icons/hicolor/16x16/apps/crusty-dlp.png", "usr/share/icons/hicolor/16x16/apps/crusty-dlp.png", "644"],
+  ["assets/icons/hicolor/24x24/apps/crusty-dlp.png", "usr/share/icons/hicolor/24x24/apps/crusty-dlp.png", "644"],
+  ["assets/icons/hicolor/32x32/apps/crusty-dlp.png", "usr/share/icons/hicolor/32x32/apps/crusty-dlp.png", "644"],
+  ["assets/icons/hicolor/48x48/apps/crusty-dlp.png", "usr/share/icons/hicolor/48x48/apps/crusty-dlp.png", "644"],
+  ["assets/icons/hicolor/64x64/apps/crusty-dlp.png", "usr/share/icons/hicolor/64x64/apps/crusty-dlp.png", "644"],
+  ["assets/icons/hicolor/128x128/apps/crusty-dlp.png", "usr/share/icons/hicolor/128x128/apps/crusty-dlp.png", "644"],
+  ["assets/icons/hicolor/256x256/apps/crusty-dlp.png", "usr/share/icons/hicolor/256x256/apps/crusty-dlp.png", "644"],
+  ["assets/icons/hicolor/512x512/apps/crusty-dlp.png", "usr/share/icons/hicolor/512x512/apps/crusty-dlp.png", "644"],
+  ["plugins/yt_dlp_plugins/extractor/boyfriendtv.py", "usr/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/boyfriendtv.py", "644"],
+  ["plugins/yt_dlp_plugins/extractor/ooxxx.py", "usr/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/ooxxx.py", "644"],
+  ["plugins/yt_dlp_plugins/extractor/pmvhaven.py", "usr/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/pmvhaven.py", "644"],
+  ["plugins/yt_dlp_plugins/extractor/spankbang.py", "usr/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/spankbang.py", "644"],
+  ["README.md", "usr/share/doc/crusty-dlp/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+name = "crusty-dlp"
+summary = "Safe terminal and desktop interfaces for yt-dlp"
+license = "MIT"
+auto-req = "auto"
+assets = [
+  { source = "target/release/crusty-dlp", dest = "/usr/bin/crusty-dlp", mode = "755" },
+  { source = "target/release/crusty-dlp-gui", dest = "/usr/bin/crusty-dlp-gui", mode = "755" },
+  { source = "assets/crusty-dlp.desktop", dest = "/usr/share/applications/crusty-dlp.desktop", mode = "644" },
+  { source = "assets/crusty-dlp.svg", dest = "/usr/share/icons/hicolor/scalable/apps/crusty-dlp.svg", mode = "644" },
+  { source = "assets/icons/hicolor/16x16/apps/crusty-dlp.png", dest = "/usr/share/icons/hicolor/16x16/apps/crusty-dlp.png", mode = "644" },
+  { source = "assets/icons/hicolor/24x24/apps/crusty-dlp.png", dest = "/usr/share/icons/hicolor/24x24/apps/crusty-dlp.png", mode = "644" },
+  { source = "assets/icons/hicolor/32x32/apps/crusty-dlp.png", dest = "/usr/share/icons/hicolor/32x32/apps/crusty-dlp.png", mode = "644" },
+  { source = "assets/icons/hicolor/48x48/apps/crusty-dlp.png", dest = "/usr/share/icons/hicolor/48x48/apps/crusty-dlp.png", mode = "644" },
+  { source = "assets/icons/hicolor/64x64/apps/crusty-dlp.png", dest = "/usr/share/icons/hicolor/64x64/apps/crusty-dlp.png", mode = "644" },
+  { source = "assets/icons/hicolor/128x128/apps/crusty-dlp.png", dest = "/usr/share/icons/hicolor/128x128/apps/crusty-dlp.png", mode = "644" },
+  { source = "assets/icons/hicolor/256x256/apps/crusty-dlp.png", dest = "/usr/share/icons/hicolor/256x256/apps/crusty-dlp.png", mode = "644" },
+  { source = "assets/icons/hicolor/512x512/apps/crusty-dlp.png", dest = "/usr/share/icons/hicolor/512x512/apps/crusty-dlp.png", mode = "644" },
+  { source = "plugins/yt_dlp_plugins/extractor/boyfriendtv.py", dest = "/usr/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/boyfriendtv.py", mode = "644" },
+  { source = "plugins/yt_dlp_plugins/extractor/ooxxx.py", dest = "/usr/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/ooxxx.py", mode = "644" },
+  { source = "plugins/yt_dlp_plugins/extractor/pmvhaven.py", dest = "/usr/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/pmvhaven.py", mode = "644" },
+  { source = "plugins/yt_dlp_plugins/extractor/spankbang.py", dest = "/usr/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/spankbang.py", mode = "644" },
+  { source = "README.md", dest = "/usr/share/doc/crusty-dlp/README.md", mode = "644", doc = true },
+]
+
+[package.metadata.generate-rpm.requires]
+yt-dlp = "*"
+
+[package.metadata.generate-rpm.recommends]
+ffmpeg = "*"
+aria2 = "*"
+deno = "*"
+python3-curl_cffi = "*"

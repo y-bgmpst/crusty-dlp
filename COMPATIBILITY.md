@@ -6,6 +6,7 @@ compatibility mechanisms for recurring failure classes.
 
 | Failure class / examples | Supported approach |
 | --- | --- |
+| YouTube, Vimeo, Dailymotion, Twitch, TikTok, Instagram, X/Twitter, SoundCloud | Use upstream yt-dlp extractors. crusty-dlp adds queueing, retries, browser-cookie support, impersonation controls, and safe argument passing around them. |
 | TLS fingerprinting, some anti-bot frontends | Select a target in the Impersonation panel. |
 | BoyfriendTV reports `Unsupported URL` | The bundled `BoyfriendTVIE` plugin parses its public source list; crusty-dlp also enables impersonation automatically. |
 | PMVHaven reports `Unsupported URL` | The bundled `PMVHavenIE` plugin reads its public VideoObject metadata and HLS manifest. |

@@ -6,7 +6,8 @@ use std::io;
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event},
+    event::{self},
+    event::{DisableMouseCapture, EnableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -37,7 +38,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
     }
 }
 
@@ -78,17 +79,18 @@ async fn main() -> Result<()> {
     }
 
     enable_raw_mode().context("could not enable terminal raw mode")?;
-    execute!(io::stdout(), EnterAlternateScreen).context("could not enter alternate screen")?;
+    execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)
+        .context("could not enter alternate screen")?;
     let _guard = TerminalGuard;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.clear()?;
 
     let (key_tx, mut key_rx) = mpsc::unbounded_channel();
-    std::thread::spawn(move || loop {
-        match event::read() {
-            Ok(Event::Key(key)) if key_tx.send(key).is_err() => break,
-            Err(_) => break,
-            _ => {}
+    std::thread::spawn(move || {
+        while let Ok(event) = event::read() {
+            if key_tx.send(event).is_err() {
+                break;
+            }
         }
     });
 
@@ -96,7 +98,7 @@ async fn main() -> Result<()> {
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
         tokio::select! {
-            Some(key) = key_rx.recv() => input::handle_key(&mut app, key),
+            Some(event) = key_rx.recv() => input::handle_event(&mut app, event),
             Some(message) = download_rx.recv() => app.handle_download_event(message),
         }
 

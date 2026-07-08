@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::AppError;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
     pub output_dir: PathBuf,
@@ -27,6 +27,8 @@ pub struct Config {
     pub max_active_downloads: u8,
     pub allow_playlists: bool,
     pub search_platform: String,
+    pub gui_theme: String,
+    pub gui_opacity: f32,
 }
 
 impl Default for Config {
@@ -50,6 +52,8 @@ impl Default for Config {
             max_active_downloads: 1,
             allow_playlists: true,
             search_platform: "youtube".into(),
+            gui_theme: "graphite".into(),
+            gui_opacity: 0.96,
         }
     }
 }
@@ -109,6 +113,8 @@ mod tests {
         assert_eq!(config.max_active_downloads, 1);
         assert!(config.allow_playlists);
         assert_eq!(config.search_platform, "youtube");
+        assert_eq!(config.gui_theme, "graphite");
+        assert_eq!(config.gui_opacity, 0.96);
     }
 
     #[test]

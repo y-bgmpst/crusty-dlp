@@ -14,7 +14,21 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
       - run: cargo build --release --locked --bins
+      - name: Build Linux distro packages
+        run: |
+          set -euo pipefail
+          cargo deb --no-build
+          cargo generate-rpm
+          mkdir -p dist/packages
+          find target/debian -maxdepth 1 -type f -name '*.deb' -exec cp {} dist/packages/ \;
+          find target/generate-rpm -maxdepth 1 -type f -name '*.rpm' -exec cp {} dist/packages/ \;
       - name: Package Linux bundle
         run: |
           set -euo pipefail
@@ -37,6 +51,8 @@ jobs:
           path: |
             dist/crusty-dlp-linux-x86_64.tar.gz
             dist/crusty-dlp-linux-x86_64.zip
+            dist/packages/*.deb
+            dist/packages/*.rpm
 
   windows:
     runs-on: windows-latest

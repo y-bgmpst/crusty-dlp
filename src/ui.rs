@@ -221,6 +221,12 @@ fn render_queue(frame: &mut Frame, area: Rect, app: &App) {
     if items.is_empty() {
         items.push(ListItem::new("Queue is empty"));
     }
+    let visible_rows = vertical[0].height.saturating_sub(2) as usize;
+    let items = items
+        .into_iter()
+        .skip(app.queue_offset)
+        .take(visible_rows.max(1))
+        .collect::<Vec<_>>();
     frame.render_widget(
         List::new(items).block(panel_block(" Queue ", app.panel == Panel::Queue)),
         vertical[0],
@@ -249,7 +255,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
     let text = format!(
-        "{}{}   │ cookies:{} │ q quit a add s search p platform o open d download c cancel b browser Tab panels ? help",
+        "{}{}   │ cookies:{} │ q quit a add s search p platform o open d download c cancel b browser mouse: queue scroll / click panel ? help",
         app.message,
         debug,
         app.cookies_browser_label()
@@ -265,7 +271,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(68, 20, area);
     frame.render_widget(Clear, popup);
-    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  s       Edit browser search query\n  p       Cycle browser search platform\n  o       Open current search in browser\n  d       Start/continue queue\n  c       Cancel active download\n  b       Cycle browser cookie source\n  r       Toggle aria2 for direct files\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nConnections: 4–8 is usually practical. Above 8 may increase throttling or HTTP 403 risk.\n\nPress any key to close";
+    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  s       Edit browser search query\n  p       Cycle browser search platform\n  o       Open current search in browser\n  d       Start/continue queue\n  c       Cancel active download\n  b       Cycle browser cookie source\n  r       Toggle aria2 for direct files\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nMouse\n\n  Wheel   Scroll queue\n  Click   Select a main panel\n\nConnections: 4–8 is usually practical. Above 8 may increase throttling or HTTP 403 risk.\n\nPress any key to close";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::bordered().title(" Help "))

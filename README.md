@@ -18,7 +18,7 @@ that require JavaScript, browser sessions, or TLS impersonation.
 - `deno` (recommended for full YouTube JavaScript challenge support)
 - A normal terminal at least 70 columns by 22 rows when using the TUI
 
-Install system dependencies:
+Install system dependencies on Arch/CachyOS:
 
 ```console
 sudo pacman -S yt-dlp ffmpeg python-curl_cffi deno
@@ -55,8 +55,57 @@ If your desktop environment does not pick up the icon immediately, run
 `gtk-update-icon-cache ~/.local/share/icons/hicolor` or log out and back in.
 
 Both bash and fish can run the resulting binary; no shell-specific integration
-is required. The included `PKGBUILD` is a draft for release packaging. Replace
-its placeholder project URL and checksum before using it to publish a package.
+is required.
+
+### Linux packages
+
+GitHub Releases provide:
+
+- `.deb` packages for Debian/Ubuntu-family systems
+- `.rpm` packages for Fedora, RHEL, and openSUSE-family systems
+- portable Linux tar/zip bundles
+
+The repository also includes:
+
+- `PKGBUILD` for Arch/CachyOS
+- `flake.nix` for NixOS
+- `packaging/gentoo/media-video/crusty-dlp/crusty-dlp-9999.ebuild` for Gentoo overlays
+
+#### Debian / Ubuntu
+
+```console
+sudo apt install ./crusty-dlp_*_amd64.deb
+sudo apt install yt-dlp ffmpeg python3-curl-cffi deno
+```
+
+#### Fedora / RHEL
+
+```console
+sudo dnf install ./crusty-dlp-*.rpm
+sudo dnf install yt-dlp ffmpeg python3-curl_cffi deno aria2
+```
+
+#### openSUSE
+
+```console
+sudo zypper install ./crusty-dlp-*.rpm
+sudo zypper install yt-dlp ffmpeg python3-curl_cffi deno aria2
+```
+
+#### NixOS
+
+```console
+nix build .#default
+nix run .#default
+```
+
+#### Gentoo
+
+Use the live ebuild from a local overlay and adjust it to your Gentoo setup as needed:
+
+```text
+packaging/gentoo/media-video/crusty-dlp/crusty-dlp-9999.ebuild
+```
 
 ### Windows
 
@@ -105,7 +154,8 @@ crusty-dlp-gui
 ```
 
 The GUI provides URL entry, mode and folder selection, browser cookies,
-impersonation, connection controls, queue progress, cancellation, and logs.
+impersonation, connection controls, queue progress, cancellation, logs, theme
+selection, and adjustable opacity.
 
 Start the terminal interface with an empty queue:
 
@@ -150,6 +200,13 @@ Run `crusty-dlp --help` for CLI details.
 
 Downloads run sequentially. After a successful item, the next waiting item
 starts automatically. Failed or cancelled entries remain visible in the queue.
+
+### TUI mouse support
+
+The TUI now supports basic mouse interaction:
+
+- mouse wheel scrolls the queue
+- left-click selects the main panels
 
 ### Parallel downloads
 
@@ -201,6 +258,21 @@ The application passes browser state through yt-dlp only for the current
 download, does not store cookie contents, and does not bypass access controls.
 See [`COMPATIBILITY.md`](COMPATIBILITY.md) for site notes and packaging details.
 
+### Mainstream site support
+
+For mainstream non-DRM sites, crusty-dlp relies on upstream yt-dlp extractors
+instead of carrying a forked copy of them. The app focuses on safe argument
+handling, cookies, impersonation, retries, and queueing for platforms such as:
+
+- YouTube
+- Vimeo
+- Dailymotion
+- Twitch
+- TikTok
+- Instagram
+- X / Twitter
+- SoundCloud
+
 ## Configuration
 
 Configuration follows the Linux XDG base directory convention and normally
@@ -223,9 +295,14 @@ cookies_browser = "none"
 concurrent_fragments = 4
 use_aria2 = false
 rate_limit = ""
+socket_timeout = ""
+retries = ""
+fragment_retries = ""
 max_active_downloads = 1
-allow_playlists = false
+allow_playlists = true
 search_platform = "youtube"
+gui_theme = "graphite"
+gui_opacity = 0.96
 ```
 
 The browser-search launcher opens the selected platform's normal search page in
@@ -249,6 +326,10 @@ system package (`sudo pacman -Syu`). This app deliberately does not handle
 passwords, exported cookie files, DRM, or access-control bypasses. For content
 you can already access in a local browser session, press `b` to select that
 browser and retry.
+
+**The GUI Paste button appears to do nothing** — update to a current build.
+The paste path now forces an immediate repaint and uses one shared clipboard
+reader for both the dedicated button and context-menu paste.
 
 **The terminal looks corrupted after an abnormal termination** — run `reset`.
 Normal errors and exits restore the terminal automatically.
