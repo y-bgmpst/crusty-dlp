@@ -4,7 +4,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     config::Config,
-    downloader::{DownloadEvent, DownloadOptions},
+    downloader::{resolve_network_tuning, DownloadEvent, DownloadOptions},
     errors::AppError,
     search::{open_platform_search, SearchPlatform},
 };
@@ -320,8 +320,14 @@ impl App {
         }
     }
 
-    pub fn download_options<'a>(&'a self, url: &str) -> DownloadOptions<'a> {
-        DownloadOptions {
+    pub fn download_options<'a>(&'a self, url: &str) -> Result<DownloadOptions<'a>, String> {
+        let tuning = resolve_network_tuning(
+            url,
+            &self.config.socket_timeout,
+            &self.config.retries,
+            &self.config.fragment_retries,
+        )?;
+        Ok(DownloadOptions {
             impersonation: self.effective_impersonation(url),
             cookies_browser: match self.config.cookies_browser.as_str() {
                 "none" => None,
@@ -332,8 +338,11 @@ impl App {
             output_template: Some(self.config.output_template.as_str()),
             rate_limit: (!self.config.rate_limit.trim().is_empty())
                 .then_some(self.config.rate_limit.trim()),
+            socket_timeout: tuning.socket_timeout,
+            retries: tuning.retries,
+            fragment_retries: tuning.fragment_retries,
             allow_playlists: self.config.allow_playlists,
-        }
+        })
     }
 
     pub fn cycle_connections(&mut self) {
@@ -589,5 +598,23 @@ mod tests {
             app.effective_impersonation("https://spankbang.com/7ubnq/video/example"),
             Some("firefox")
         );
+    }
+
+    #[test]
+    fn pmvhaven_download_options_apply_resilient_defaults() {
+        let app = App::new(
+            Config::default(),
+            "config.toml".into(),
+            false,
+            false,
+            Vec::new(),
+            false,
+        );
+        let options = app
+            .download_options("https://pmvhaven.com/video/example")
+            .unwrap();
+        assert_eq!(options.socket_timeout, Some(60));
+        assert_eq!(options.retries, Some(10));
+        assert_eq!(options.fragment_retries, Some(10));
     }
 }

@@ -34,6 +34,7 @@ pub struct Downloader {
 pub struct PlaylistEntry {
     pub title: Option<String>,
     pub url: String,
+    pub thumbnail_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -44,7 +45,17 @@ pub struct DownloadOptions<'a> {
     pub use_aria2: bool,
     pub output_template: Option<&'a str>,
     pub rate_limit: Option<&'a str>,
+    pub socket_timeout: Option<u32>,
+    pub retries: Option<u32>,
+    pub fragment_retries: Option<u32>,
     pub allow_playlists: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NetworkTuning {
+    pub socket_timeout: Option<u32>,
+    pub retries: Option<u32>,
+    pub fragment_retries: Option<u32>,
 }
 
 impl Default for DownloadOptions<'_> {
@@ -56,6 +67,9 @@ impl Default for DownloadOptions<'_> {
             use_aria2: false,
             output_template: None,
             rate_limit: None,
+            socket_timeout: None,
+            retries: None,
+            fragment_retries: None,
             allow_playlists: false,
         }
     }
@@ -101,6 +115,18 @@ impl Downloader {
         if let Some(rate_limit) = options.rate_limit {
             args.push(OsString::from("--limit-rate"));
             args.push(OsString::from(rate_limit));
+        }
+        if let Some(socket_timeout) = options.socket_timeout {
+            args.push(OsString::from("--socket-timeout"));
+            args.push(OsString::from(socket_timeout.to_string()));
+        }
+        if let Some(retries) = options.retries {
+            args.push(OsString::from("--retries"));
+            args.push(OsString::from(retries.to_string()));
+        }
+        if let Some(fragment_retries) = options.fragment_retries {
+            args.push(OsString::from("--fragment-retries"));
+            args.push(OsString::from(fragment_retries.to_string()));
         }
         if options.use_aria2 {
             args.extend([
@@ -365,7 +391,7 @@ fn playlist_probe_arguments() -> [&'static str; 4] {
     [
         "--flat-playlist",
         "--print",
-        "%(title)s\t%(id)s\t%(webpage_url)s\t%(url)s",
+        "%(title)s\t%(id)s\t%(webpage_url)s\t%(url)s\t%(thumbnail)s",
         "--",
     ]
 }
@@ -375,6 +401,23 @@ fn expand_pmvhaven_playlist_urls(
     url: &str,
 ) -> Result<Option<Vec<PlaylistEntry>>, String> {
     let canonical_url = canonical_pmvhaven_playlist_url(url);
+    let html_output = StdCommand::new("curl")
+        .args(["-fsSL", "--"])
+        .arg(&canonical_url)
+        .output()
+        .map_err(|error| format!("could not inspect PMVHaven playlist HTML: {error}"))?;
+    if html_output.status.success() {
+        let html = String::from_utf8_lossy(&html_output.stdout);
+        let entries = dedupe_playlist_entries(parse_pmvhaven_itemlist_entries(&html));
+        if !entries.is_empty() {
+            return Ok(Some(entries));
+        }
+        let href_entries = dedupe_playlist_entries(parse_pmvhaven_href_entries(&html));
+        if !href_entries.is_empty() {
+            return Ok(Some(href_entries));
+        }
+    }
+
     let mut command = StdCommand::new(executable);
     command.args(playlist_probe_arguments());
     if let Some(plugin_dir) = plugin_directory() {
@@ -385,7 +428,7 @@ fn expand_pmvhaven_playlist_urls(
         .output()
         .map_err(|error| format!("could not inspect PMVHaven playlist: {error}"))?;
     let mut yt_dlp_error = None;
-    let mut entries = if output.status.success() {
+    let entries = if output.status.success() {
         dedupe_playlist_entries(
             String::from_utf8_lossy(&output.stdout)
                 .lines()
@@ -406,20 +449,6 @@ fn expand_pmvhaven_playlist_urls(
     };
 
     if entries.is_empty() {
-        let output = StdCommand::new("curl")
-            .args(["-fsSL", "--"])
-            .arg(&canonical_url)
-            .output()
-            .map_err(|error| format!("could not inspect PMVHaven playlist HTML: {error}"))?;
-        if output.status.success() {
-            let html = String::from_utf8_lossy(&output.stdout);
-            entries = dedupe_playlist_entries(parse_pmvhaven_itemlist_entries(&html));
-            if entries.is_empty() {
-                entries = dedupe_playlist_entries(parse_pmvhaven_href_entries(&html));
-            }
-        }
-    }
-    if entries.is_empty() {
         if let Some(message) = yt_dlp_error {
             return Err(message);
         }
@@ -434,6 +463,7 @@ fn parse_pmvhaven_itemlist_entries(html: &str) -> Vec<PlaylistEntry> {
     let mut entries = Vec::new();
     let mut cursor = html;
     let name_key = "\"name\":\"";
+    let thumbnail_key = "\"thumbnailUrl\":[\"";
     let embed_key = "embedUrl\":\"";
 
     while let Some((before_embed, after_embed)) = cursor.split_once(embed_key) {
@@ -448,9 +478,16 @@ fn parse_pmvhaven_itemlist_entries(html: &str) -> Vec<PlaylistEntry> {
                 .and_then(|fragment| fragment.split_once('"').map(|(value, _)| value))
                 .map(decode_json_escapes)
                 .filter(|value| !value.trim().is_empty());
+            let thumbnail_url = before_embed
+                .rsplit(thumbnail_key)
+                .next()
+                .and_then(|fragment| fragment.split_once('"').map(|(value, _)| value))
+                .map(decode_json_escapes)
+                .filter(|value| value.starts_with("http://") || value.starts_with("https://"));
             entries.push(PlaylistEntry {
                 title,
                 url: embed_url,
+                thumbnail_url,
             });
         }
         cursor = rest;
@@ -470,6 +507,7 @@ fn parse_pmvhaven_href_entries(html: &str) -> Vec<PlaylistEntry> {
             entries.push(PlaylistEntry {
                 title: None,
                 url: format!("https://pmvhaven.com/video/{slug}"),
+                thumbnail_url: None,
             });
         }
         cursor = rest;
@@ -592,6 +630,71 @@ pub fn validate_rate_limit(value: &str) -> Result<(), String> {
     }
 }
 
+pub fn validate_socket_timeout(value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    let parsed = trimmed
+        .parse::<u32>()
+        .map_err(|_| "Socket timeout must be a whole number of seconds".to_owned())?;
+    if parsed == 0 {
+        return Err("Socket timeout must be greater than 0 seconds".into());
+    }
+    Ok(())
+}
+
+pub fn validate_retry_count(value: &str, field_name: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(());
+    }
+    trimmed
+        .parse::<u32>()
+        .map(|_| ())
+        .map_err(|_| format!("{field_name} must be a whole number"))
+}
+
+pub fn resolve_network_tuning(
+    url: &str,
+    socket_timeout: &str,
+    retries: &str,
+    fragment_retries: &str,
+) -> Result<NetworkTuning, String> {
+    let pmvhaven_defaults = url_host_matches(url, "pmvhaven.com");
+    Ok(NetworkTuning {
+        socket_timeout: parse_socket_timeout(socket_timeout)?
+            .or_else(|| pmvhaven_defaults.then_some(60)),
+        retries: parse_retry_count(retries, "Retries")?.or_else(|| pmvhaven_defaults.then_some(10)),
+        fragment_retries: parse_retry_count(fragment_retries, "Fragment retries")?
+            .or_else(|| pmvhaven_defaults.then_some(10)),
+    })
+}
+
+fn parse_socket_timeout(value: &str) -> Result<Option<u32>, String> {
+    validate_socket_timeout(value)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| "Socket timeout must be a whole number of seconds".to_owned())
+}
+
+fn parse_retry_count(value: &str, field_name: &str) -> Result<Option<u32>, String> {
+    validate_retry_count(value, field_name)?;
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    trimmed
+        .parse::<u32>()
+        .map(Some)
+        .map_err(|_| format!("{field_name} must be a whole number"))
+}
+
 #[cfg(unix)]
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
@@ -622,7 +725,7 @@ fn url_host_matches(value: &str, expected: &str) -> bool {
 }
 
 fn parse_flat_playlist_line(line: &str, source: PlaylistSource) -> Option<PlaylistEntry> {
-    let mut fields = line.splitn(4, '\t');
+    let mut fields = line.splitn(5, '\t');
     let title = fields
         .next()
         .and_then(non_empty_trimmed)
@@ -631,6 +734,11 @@ fn parse_flat_playlist_line(line: &str, source: PlaylistSource) -> Option<Playli
     let id = fields.next().and_then(non_empty_trimmed);
     let webpage_url = fields.next().and_then(non_empty_trimmed);
     let media_url = fields.next().and_then(non_empty_trimmed);
+    let thumbnail_url = fields
+        .next()
+        .and_then(non_empty_trimmed)
+        .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
+        .map(str::to_owned);
 
     webpage_url
         .filter(|value| value.starts_with("http://") || value.starts_with("https://"))
@@ -641,7 +749,11 @@ fn parse_flat_playlist_line(line: &str, source: PlaylistSource) -> Option<Playli
                 .map(str::to_owned)
         })
         .or_else(|| fallback_playlist_entry_url(source, id))
-        .map(|url| PlaylistEntry { title, url })
+        .map(|url| PlaylistEntry {
+            title,
+            url,
+            thumbnail_url,
+        })
 }
 
 fn non_empty_trimmed(value: &str) -> Option<&str> {
@@ -802,6 +914,30 @@ mod tests {
     }
 
     #[test]
+    fn socket_timeout_and_retry_arguments_are_separate() {
+        let downloader = Downloader::new("yt-dlp".into(), "/tmp/out".into());
+        let args = downloader.arguments(
+            "https://pmvhaven.com/video/example",
+            &DownloadMode::Video,
+            DownloadOptions {
+                socket_timeout: Some(60),
+                retries: Some(10),
+                fragment_retries: Some(10),
+                ..DownloadOptions::default()
+            },
+        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--socket-timeout" && pair[1] == "60"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--retries" && pair[1] == "10"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--fragment-retries" && pair[1] == "10"));
+    }
+
+    #[test]
     fn rejects_unsafe_output_template() {
         assert!(validate_output_template("../bad.%(ext)s").is_err());
         assert!(validate_output_template("/abs/bad.%(ext)s").is_err());
@@ -815,6 +951,49 @@ mod tests {
         assert!(validate_rate_limit("1.5Mi").is_ok());
         assert!(validate_rate_limit("fast").is_err());
         assert!(validate_rate_limit("5MBps").is_err());
+    }
+
+    #[test]
+    fn validates_network_tuning_syntax() {
+        assert!(validate_socket_timeout("").is_ok());
+        assert!(validate_socket_timeout("60").is_ok());
+        assert!(validate_socket_timeout("0").is_err());
+        assert!(validate_retry_count("", "Retries").is_ok());
+        assert!(validate_retry_count("0", "Retries").is_ok());
+        assert!(validate_retry_count("10", "Retries").is_ok());
+        assert!(validate_retry_count("many", "Retries").is_err());
+    }
+
+    #[test]
+    fn pmvhaven_defaults_network_tuning_when_blank() {
+        assert_eq!(
+            resolve_network_tuning("https://pmvhaven.com/video/example", "", "", "",).unwrap(),
+            NetworkTuning {
+                socket_timeout: Some(60),
+                retries: Some(10),
+                fragment_retries: Some(10),
+            }
+        );
+    }
+
+    #[test]
+    fn non_pmvhaven_leaves_blank_network_tuning_unset() {
+        assert_eq!(
+            resolve_network_tuning("https://www.youtube.com/watch?v=abc123", "", "", "",).unwrap(),
+            NetworkTuning::default()
+        );
+    }
+
+    #[test]
+    fn explicit_network_tuning_overrides_pmvhaven_defaults() {
+        assert_eq!(
+            resolve_network_tuning("https://pmvhaven.com/video/example", "75", "4", "6",).unwrap(),
+            NetworkTuning {
+                socket_timeout: Some(75),
+                retries: Some(4),
+                fragment_retries: Some(6),
+            }
+        );
     }
 
     #[test]
@@ -872,9 +1051,9 @@ mod tests {
     #[test]
     fn parses_flat_playlist_entries() {
         let urls = [
-            "Title A\tabc123\thttps://www.youtube.com/watch?v=abc123\tabc123",
-            "Title B\tdef456\t\tdef456",
-            "Title C\tghi789\t\thttps://spankbang.com/ghi789/video/ghi789",
+            "Title A\tabc123\thttps://www.youtube.com/watch?v=abc123\tabc123\thttps://img.example/a.jpg",
+            "Title B\tdef456\t\tdef456\t",
+            "Title C\tghi789\t\thttps://spankbang.com/ghi789/video/ghi789\thttps://img.example/c.webp",
         ]
         .into_iter()
         .filter_map(|line| parse_flat_playlist_line(line, PlaylistSource::YouTube))
@@ -885,14 +1064,17 @@ mod tests {
                 PlaylistEntry {
                     title: Some("Title A".into()),
                     url: "https://www.youtube.com/watch?v=abc123".into(),
+                    thumbnail_url: Some("https://img.example/a.jpg".into()),
                 },
                 PlaylistEntry {
                     title: Some("Title B".into()),
                     url: "https://www.youtube.com/watch?v=def456".into(),
+                    thumbnail_url: None,
                 },
                 PlaylistEntry {
                     title: Some("Title C".into()),
                     url: "https://spankbang.com/ghi789/video/ghi789".into(),
+                    thumbnail_url: Some("https://img.example/c.webp".into()),
                 },
             ]
         );
@@ -905,6 +1087,7 @@ mod tests {
             Some(PlaylistEntry {
                 title: Some("Title X".into()),
                 url: "https://pmvhaven.com/video/pmv001".into(),
+                thumbnail_url: None,
             })
         );
         assert_eq!(
@@ -912,6 +1095,7 @@ mod tests {
             Some(PlaylistEntry {
                 title: Some("Title Y".into()),
                 url: "https://spankbang.com/sb001/video/sb001".into(),
+                thumbnail_url: None,
             })
         );
     }
@@ -923,7 +1107,7 @@ mod tests {
             [
                 "--flat-playlist",
                 "--print",
-                "%(title)s\t%(id)s\t%(webpage_url)s\t%(url)s",
+                "%(title)s\t%(id)s\t%(webpage_url)s\t%(url)s\t%(thumbnail)s",
                 "--"
             ]
         );
@@ -957,10 +1141,12 @@ mod tests {
                 PlaylistEntry {
                     title: None,
                     url: "https://pmvhaven.com/video/bimbo-candy-1_656b815db380dff74beb2d65".into(),
+                    thumbnail_url: None,
                 },
                 PlaylistEntry {
                     title: None,
                     url: "https://pmvhaven.com/video/another-one_123".into(),
+                    thumbnail_url: None,
                 }
             ]
         );
@@ -970,8 +1156,8 @@ mod tests {
     fn parses_pmvhaven_embed_entries() {
         let html = r#"
             <script type="application/ld+json">{"@type":"ItemList","itemListElement":[
-                {"item":{"@type":"VideoObject","name":"Bambi TikTok 7","embedUrl":"https://pmvhaven.com/videos/68f6982abdaea7d82ecae26f"}},
-                {"item":{"@type":"VideoObject","name":"Best friend","embedUrl":"https://pmvhaven.com/videos/68f69f02bdaea7d82ecb0064"}}
+                {"item":{"@type":"VideoObject","name":"Bambi TikTok 7","thumbnailUrl":["https://img.example/a.webp"],"embedUrl":"https://pmvhaven.com/videos/68f6982abdaea7d82ecae26f"}},
+                {"item":{"@type":"VideoObject","name":"Best friend","thumbnailUrl":["https://img.example/b.webp"],"embedUrl":"https://pmvhaven.com/videos/68f69f02bdaea7d82ecb0064"}}
             ]}</script>
         "#;
         assert_eq!(
@@ -980,10 +1166,12 @@ mod tests {
                 PlaylistEntry {
                     title: Some("Bambi TikTok 7".into()),
                     url: "https://pmvhaven.com/videos/68f6982abdaea7d82ecae26f".into(),
+                    thumbnail_url: Some("https://img.example/a.webp".into()),
                 },
                 PlaylistEntry {
                     title: Some("Best friend".into()),
                     url: "https://pmvhaven.com/videos/68f69f02bdaea7d82ecb0064".into(),
+                    thumbnail_url: Some("https://img.example/b.webp".into()),
                 }
             ]
         );
@@ -1005,14 +1193,17 @@ mod tests {
             PlaylistEntry {
                 title: Some("First".into()),
                 url: "https://example.com/a".into(),
+                thumbnail_url: Some("https://img.example/first.jpg".into()),
             },
             PlaylistEntry {
                 title: Some("Duplicate".into()),
                 url: "https://example.com/a".into(),
+                thumbnail_url: Some("https://img.example/duplicate.jpg".into()),
             },
             PlaylistEntry {
                 title: Some("Second".into()),
                 url: "https://example.com/b".into(),
+                thumbnail_url: None,
             },
         ];
         assert_eq!(
@@ -1021,10 +1212,12 @@ mod tests {
                 PlaylistEntry {
                     title: Some("First".into()),
                     url: "https://example.com/a".into(),
+                    thumbnail_url: Some("https://img.example/first.jpg".into()),
                 },
                 PlaylistEntry {
                     title: Some("Second".into()),
                     url: "https://example.com/b".into(),
+                    thumbnail_url: None,
                 },
             ]
         );

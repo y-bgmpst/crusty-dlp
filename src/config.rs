@@ -21,6 +21,9 @@ pub struct Config {
     pub concurrent_fragments: u8,
     pub use_aria2: bool,
     pub rate_limit: String,
+    pub socket_timeout: String,
+    pub retries: String,
+    pub fragment_retries: String,
     pub max_active_downloads: u8,
     pub allow_playlists: bool,
     pub search_platform: String,
@@ -41,6 +44,9 @@ impl Default for Config {
             concurrent_fragments: 4,
             use_aria2: false,
             rate_limit: String::new(),
+            socket_timeout: String::new(),
+            retries: String::new(),
+            fragment_retries: String::new(),
             max_active_downloads: 1,
             allow_playlists: true,
             search_platform: "youtube".into(),
@@ -97,6 +103,9 @@ mod tests {
         assert_eq!(config.output_template, "%(title)s [%(id)s].%(ext)s");
         assert_eq!(config.default_mode, "video");
         assert_eq!(config.rate_limit, "");
+        assert_eq!(config.socket_timeout, "");
+        assert_eq!(config.retries, "");
+        assert_eq!(config.fragment_retries, "");
         assert_eq!(config.max_active_downloads, 1);
         assert!(config.allow_playlists);
         assert_eq!(config.search_platform, "youtube");

@@ -12,13 +12,15 @@ use crusty_dlp::{
     config::Config,
     downloader::{
         available_impersonation_targets, current_executable_path, dependency_path,
-        expand_playlist_urls, resolved_plugin_directory, supports_playlist_expansion,
-        validate_output_template, validate_rate_limit, DownloadEvent, DownloadOptions, Downloader,
+        expand_playlist_urls, resolve_network_tuning, resolved_plugin_directory,
+        supports_playlist_expansion, validate_output_template, validate_rate_limit,
+        validate_retry_count, validate_socket_timeout, DownloadEvent, DownloadOptions, Downloader,
         PlaylistEntry,
     },
     search::{open_platform_search, SearchPlatform},
 };
 use eframe::egui::{self, Color32, RichText};
+use image::ImageReader;
 use tokio::sync::{mpsc, oneshot};
 
 const BLUE: Color32 = Color32::from_rgb(47, 128, 237);
@@ -51,6 +53,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&app_title)
+            .with_icon(app_icon())
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([960.0, 660.0]),
         ..Default::default()
@@ -71,10 +74,40 @@ fn build_label() -> String {
     format!("v{APP_VERSION}+{BUILD_GIT_SHA}{dirty_suffix}")
 }
 
-#[derive(Debug)]
+fn app_icon() -> egui::IconData {
+    let size = 64usize;
+    let mut rgba = vec![0u8; size * size * 4];
+
+    fill_rounded_rect(&mut rgba, size, (4, 4), (56, 56), 14.0, [18, 22, 27, 255]);
+    fill_circle(&mut rgba, size, 32.0, 27.0, 16.0, [234, 93, 36, 255]);
+    fill_circle(&mut rgba, size, 32.0, 27.0, 10.0, [27, 32, 38, 255]);
+    fill_triangle(
+        &mut rgba,
+        size,
+        (28.0, 21.0),
+        (41.0, 27.0),
+        (28.0, 33.0),
+        [74, 163, 255, 255],
+    );
+    fill_circle(&mut rgba, size, 18.0, 17.0, 4.0, [255, 138, 61, 255]);
+    fill_circle(&mut rgba, size, 46.0, 17.0, 4.0, [255, 138, 61, 255]);
+    fill_circle(&mut rgba, size, 18.0, 42.0, 6.0, [255, 138, 61, 255]);
+    fill_circle(&mut rgba, size, 46.0, 42.0, 6.0, [255, 138, 61, 255]);
+    fill_rounded_rect(&mut rgba, size, (24, 44), (16, 7), 3.5, [47, 128, 237, 255]);
+
+    egui::IconData {
+        rgba,
+        width: size as u32,
+        height: size as u32,
+    }
+}
+
 struct GuiQueueItem {
     title: Option<String>,
     url: String,
+    thumbnail_url: Option<String>,
+    thumbnail_image: Option<DecodedThumbnail>,
+    thumbnail_texture: Option<egui::TextureHandle>,
     state: DownloadState,
     progress: f32,
     progress_text: String,
@@ -87,6 +120,17 @@ struct JobEvent {
     event: DownloadEvent,
 }
 
+struct QueueThumbnailEvent {
+    index: usize,
+    result: Result<DecodedThumbnail, String>,
+}
+
+struct DecodedThumbnail {
+    rgba: Vec<u8>,
+    width: usize,
+    height: usize,
+}
+
 struct GuiApp {
     config: Config,
     config_path: Option<PathBuf>,
@@ -95,6 +139,9 @@ struct GuiApp {
     output_dir_text: String,
     output_template_text: String,
     rate_limit_text: String,
+    socket_timeout_text: String,
+    retries_text: String,
+    fragment_retries_text: String,
     mode: DownloadMode,
     queue: Vec<GuiQueueItem>,
     queue_running: bool,
@@ -105,6 +152,8 @@ struct GuiApp {
     logs: VecDeque<String>,
     status: String,
     folder_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
+    thumbnail_rx: Receiver<QueueThumbnailEvent>,
+    thumbnail_tx: std_mpsc::Sender<QueueThumbnailEvent>,
 }
 
 impl GuiApp {
@@ -127,6 +176,7 @@ impl GuiApp {
             .map(available_impersonation_targets)
             .unwrap_or_default();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (thumbnail_tx, thumbnail_rx) = std_mpsc::channel();
         let status = if yt_dlp.is_some() {
             "Ready".to_owned()
         } else {
@@ -136,6 +186,9 @@ impl GuiApp {
             output_dir_text: config.output_dir.to_string_lossy().into_owned(),
             output_template_text: config.output_template.clone(),
             rate_limit_text: config.rate_limit.clone(),
+            socket_timeout_text: config.socket_timeout.clone(),
+            retries_text: config.retries.clone(),
+            fragment_retries_text: config.fragment_retries.clone(),
             search_query: String::new(),
             config,
             config_path,
@@ -150,6 +203,8 @@ impl GuiApp {
             logs: VecDeque::new(),
             status,
             folder_picker_rx: None,
+            thumbnail_rx,
+            thumbnail_tx,
         }
     }
 
@@ -265,24 +320,54 @@ impl GuiApp {
     }
 
     fn enqueue_url(&mut self, url: &str) {
-        self.enqueue_queue_item(None, url, true);
+        self.enqueue_queue_item(None, url, None, true);
     }
 
     fn enqueue_playlist_entry(&mut self, entry: &PlaylistEntry) {
-        self.enqueue_queue_item(entry.title.clone(), &entry.url, false);
+        self.enqueue_queue_item(
+            entry.title.clone(),
+            &entry.url,
+            entry.thumbnail_url.clone(),
+            false,
+        );
     }
 
-    fn enqueue_queue_item(&mut self, title: Option<String>, url: &str, log_add: bool) {
+    fn enqueue_queue_item(
+        &mut self,
+        title: Option<String>,
+        url: &str,
+        thumbnail_url: Option<String>,
+        log_add: bool,
+    ) {
         if log_add {
             self.log(format!("Added to queue: {url}"));
         }
+        let index = self.queue.len();
         self.queue.push(GuiQueueItem {
             title,
             url: url.to_owned(),
+            thumbnail_url,
+            thumbnail_image: None,
+            thumbnail_texture: None,
             state: DownloadState::Waiting,
             progress: 0.0,
             progress_text: String::new(),
             error: None,
+        });
+        self.request_thumbnail(index);
+    }
+
+    fn request_thumbnail(&self, index: usize) {
+        let Some(item) = self.queue.get(index) else {
+            return;
+        };
+        let Some(thumbnail_url) = item.thumbnail_url.clone() else {
+            return;
+        };
+        let tx = self.thumbnail_tx.clone();
+        std::thread::spawn(move || {
+            let result = download_thumbnail(&thumbnail_url);
+            let _ = tx.send(QueueThumbnailEvent { index, result });
         });
     }
 
@@ -320,6 +405,46 @@ impl GuiApp {
         self.rate_limit_text = trimmed.to_owned();
         self.save_config();
         true
+    }
+
+    fn apply_socket_timeout(&mut self) -> bool {
+        let trimmed = self.socket_timeout_text.trim();
+        if let Err(error) = validate_socket_timeout(trimmed) {
+            self.status = error;
+            return false;
+        }
+        self.config.socket_timeout = trimmed.to_owned();
+        self.socket_timeout_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn apply_retries(&mut self) -> bool {
+        let trimmed = self.retries_text.trim();
+        if let Err(error) = validate_retry_count(trimmed, "Retries") {
+            self.status = error;
+            return false;
+        }
+        self.config.retries = trimmed.to_owned();
+        self.retries_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn apply_fragment_retries(&mut self) -> bool {
+        let trimmed = self.fragment_retries_text.trim();
+        if let Err(error) = validate_retry_count(trimmed, "Fragment retries") {
+            self.status = error;
+            return false;
+        }
+        self.config.fragment_retries = trimmed.to_owned();
+        self.fragment_retries_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
+    fn apply_network_tuning(&mut self) -> bool {
+        self.apply_socket_timeout() && self.apply_retries() && self.apply_fragment_retries()
     }
 
     fn start_queue(&mut self) {
@@ -381,7 +506,11 @@ impl GuiApp {
             self.fail(index, "ffmpeg is required for this download mode");
             return false;
         }
-        if !self.apply_output_dir() || !self.apply_output_template() || !self.apply_rate_limit() {
+        if !self.apply_output_dir()
+            || !self.apply_output_template()
+            || !self.apply_rate_limit()
+            || !self.apply_network_tuning()
+        {
             self.fail(index, &self.status.clone());
             return false;
         }
@@ -527,6 +656,14 @@ impl GuiApp {
             }
         }
 
+        while let Ok(event) = self.thumbnail_rx.try_recv() {
+            if let Some(item) = self.queue.get_mut(event.index) {
+                if let Ok(image) = event.result {
+                    item.thumbnail_image = Some(image);
+                }
+            }
+        }
+
         if self.queue_running {
             self.fill_slots();
         } else if self.active_downloads.is_empty()
@@ -539,6 +676,23 @@ impl GuiApp {
         }
 
         self.poll_folder_picker();
+    }
+
+    fn ensure_thumbnail_textures(&mut self, ctx: &egui::Context) {
+        for (index, item) in self.queue.iter_mut().enumerate() {
+            if item.thumbnail_texture.is_some() {
+                continue;
+            }
+            let Some(image) = item.thumbnail_image.take() else {
+                continue;
+            };
+            let texture = ctx.load_texture(
+                format!("queue-thumb-{index}"),
+                egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba),
+                egui::TextureOptions::LINEAR,
+            );
+            item.thumbnail_texture = Some(texture);
+        }
     }
 
     fn poll_folder_picker(&mut self) {
@@ -897,9 +1051,56 @@ impl GuiApp {
             }
         });
         ui.small("The limit applies per active download process.");
+
+        ui.add_space(8.0);
+        ui.label(RichText::new("Network resilience").strong());
+
+        ui.horizontal(|ui| {
+            ui.label("Socket timeout");
+            let response = text_edit_with_context_menu(
+                ui,
+                &mut self.socket_timeout_text,
+                "auto / 60 for PMVHaven",
+                170.0,
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.apply_socket_timeout();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Retries");
+            let response = text_edit_with_context_menu(
+                ui,
+                &mut self.retries_text,
+                "auto / 10 for PMVHaven",
+                170.0,
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.apply_retries();
+            }
+        });
+
+        ui.horizontal(|ui| {
+            ui.label("Fragment retries");
+            let response = text_edit_with_context_menu(
+                ui,
+                &mut self.fragment_retries_text,
+                "auto / 10 for PMVHaven",
+                170.0,
+            );
+            if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+                self.apply_fragment_retries();
+            }
+        });
+
+        if ui.button("Apply tuning").clicked() {
+            self.apply_network_tuning();
+        }
+        ui.small("Blank keeps yt-dlp defaults, except PMVHaven uses 60 / 10 / 10.");
     }
 
-    fn queue_panel(&mut self, ui: &mut egui::Ui) {
+    fn queue_panel(&mut self, ui: &mut egui::Ui, max_height: f32) {
         section_frame(ui, &format!("Queue ({})", self.queue.len()), |ui| {
             let full_width = ui.available_width();
             let number_width = 22.0;
@@ -951,7 +1152,7 @@ impl GuiApp {
             });
             ui.separator();
             egui::ScrollArea::vertical()
-                .max_height(360.0)
+                .max_height(max_height.max(120.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     if self.queue.is_empty() {
@@ -1028,6 +1229,48 @@ impl GuiApp {
                     }
                 } else {
                     ui.label("No active downloads");
+                    let waiting_indices: Vec<_> = self
+                        .queue
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, item)| {
+                            (item.state == DownloadState::Waiting).then_some(index)
+                        })
+                        .collect();
+                    if !waiting_indices.is_empty() {
+                        ui.add_space(8.0);
+                        ui.label(RichText::new("Waiting items").strong());
+                        egui::ScrollArea::vertical()
+                            .max_height(92.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for index in waiting_indices {
+                                    if let Some(item) = self.queue.get(index) {
+                                        ui.horizontal(|ui| {
+                                            thumbnail_placeholder(ui, item);
+                                            ui.vertical(|ui| {
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(queue_item_title(item))
+                                                            .strong(),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(&item.url)
+                                                            .size(12.0)
+                                                            .color(Color32::GRAY),
+                                                    )
+                                                    .truncate(),
+                                                );
+                                            });
+                                        });
+                                        ui.add_space(6.0);
+                                    }
+                                }
+                            });
+                    }
                 }
 
                 ui.add_space(12.0);
@@ -1118,6 +1361,7 @@ impl GuiApp {
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_events();
+        self.ensure_thumbnail_textures(ctx);
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading(
@@ -1149,17 +1393,12 @@ impl eframe::App for GuiApp {
                     });
             });
         egui::CentralPanel::default().show(ctx, |ui| {
-            egui::TopBottomPanel::bottom("queue_log_panel")
-                .resizable(false)
-                .exact_height(240.0)
-                .show_inside(ui, |ui| self.queue_log_panel(ui));
-            egui::TopBottomPanel::bottom("queue_controls_panel")
-                .resizable(false)
-                .exact_height(220.0)
-                .show_inside(ui, |ui| self.queue_controls_panel(ui));
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| self.queue_panel(ui));
+            let queue_max_height = (ui.available_height() * 0.42).clamp(180.0, 360.0);
+            self.queue_panel(ui, queue_max_height);
+            ui.add_space(10.0);
+            self.queue_controls_panel(ui);
+            ui.add_space(10.0);
+            self.queue_log_panel(ui);
         });
         egui::TopBottomPanel::bottom("footer").show(ctx, |ui| {
             ui.vertical(|ui| {
@@ -1216,6 +1455,9 @@ struct OwnedDownloadOptions {
     use_aria2: bool,
     output_template: String,
     rate_limit: Option<String>,
+    socket_timeout: Option<u32>,
+    retries: Option<u32>,
+    fragment_retries: Option<u32>,
     allow_playlists: bool,
 }
 
@@ -1223,6 +1465,12 @@ impl OwnedDownloadOptions {
     fn from_config(config: &Config, url: &str) -> Result<Self, String> {
         validate_output_template(&config.output_template)?;
         validate_rate_limit(&config.rate_limit)?;
+        let tuning = resolve_network_tuning(
+            url,
+            &config.socket_timeout,
+            &config.retries,
+            &config.fragment_retries,
+        )?;
 
         let browser = (config.cookies_browser != "none").then(|| config.cookies_browser.clone());
         let mut impersonation =
@@ -1244,6 +1492,9 @@ impl OwnedDownloadOptions {
             output_template: config.output_template.trim().to_owned(),
             rate_limit: (!config.rate_limit.trim().is_empty())
                 .then(|| config.rate_limit.trim().to_owned()),
+            socket_timeout: tuning.socket_timeout,
+            retries: tuning.retries,
+            fragment_retries: tuning.fragment_retries,
             allow_playlists: config.allow_playlists,
         })
     }
@@ -1256,6 +1507,9 @@ impl OwnedDownloadOptions {
             use_aria2: self.use_aria2,
             output_template: Some(self.output_template.as_str()),
             rate_limit: self.rate_limit.as_deref(),
+            socket_timeout: self.socket_timeout,
+            retries: self.retries,
+            fragment_retries: self.fragment_retries,
             allow_playlists: self.allow_playlists,
         }
     }
@@ -1279,6 +1533,98 @@ fn configure_style(ctx: &egui::Context) {
     style.visuals.widgets.active.corner_radius = 8.into();
     style.visuals.widgets.hovered.corner_radius = 8.into();
     ctx.set_style(style);
+}
+
+fn fill_rounded_rect(
+    rgba: &mut [u8],
+    size: usize,
+    origin: (usize, usize),
+    dimensions: (usize, usize),
+    radius: f32,
+    color: [u8; 4],
+) {
+    let (x, y) = origin;
+    let (width, height) = dimensions;
+    let radius_sq = radius * radius;
+    for py in y..(y + height).min(size) {
+        for px in x..(x + width).min(size) {
+            let dx = if px < x + radius as usize {
+                (x + radius as usize) as f32 - px as f32
+            } else if px >= x + width - radius as usize {
+                px as f32 - (x + width - radius as usize - 1) as f32
+            } else {
+                0.0
+            };
+            let dy = if py < y + radius as usize {
+                (y + radius as usize) as f32 - py as f32
+            } else if py >= y + height - radius as usize {
+                py as f32 - (y + height - radius as usize - 1) as f32
+            } else {
+                0.0
+            };
+            if dx == 0.0 && dy == 0.0 || dx * dx + dy * dy <= radius_sq {
+                set_pixel(rgba, size, px, py, color);
+            }
+        }
+    }
+}
+
+fn fill_circle(rgba: &mut [u8], size: usize, cx: f32, cy: f32, radius: f32, color: [u8; 4]) {
+    let radius_sq = radius * radius;
+    let min_x = (cx - radius).floor().max(0.0) as usize;
+    let max_x = (cx + radius).ceil().min(size as f32 - 1.0) as usize;
+    let min_y = (cy - radius).floor().max(0.0) as usize;
+    let max_y = (cy + radius).ceil().min(size as f32 - 1.0) as usize;
+    for py in min_y..=max_y {
+        for px in min_x..=max_x {
+            let dx = px as f32 - cx;
+            let dy = py as f32 - cy;
+            if dx * dx + dy * dy <= radius_sq {
+                set_pixel(rgba, size, px, py, color);
+            }
+        }
+    }
+}
+
+fn fill_triangle(
+    rgba: &mut [u8],
+    size: usize,
+    a: (f32, f32),
+    b: (f32, f32),
+    c: (f32, f32),
+    color: [u8; 4],
+) {
+    let min_x = a.0.min(b.0).min(c.0).floor().max(0.0) as usize;
+    let max_x = a.0.max(b.0).max(c.0).ceil().min(size as f32 - 1.0) as usize;
+    let min_y = a.1.min(b.1).min(c.1).floor().max(0.0) as usize;
+    let max_y = a.1.max(b.1).max(c.1).ceil().min(size as f32 - 1.0) as usize;
+
+    for py in min_y..=max_y {
+        for px in min_x..=max_x {
+            let point = (px as f32 + 0.5, py as f32 + 0.5);
+            if point_in_triangle(point, a, b, c) {
+                set_pixel(rgba, size, px, py, color);
+            }
+        }
+    }
+}
+
+fn point_in_triangle(p: (f32, f32), a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
+    let area = |p1: (f32, f32), p2: (f32, f32), p3: (f32, f32)| {
+        (p1.0 * (p2.1 - p3.1) + p2.0 * (p3.1 - p1.1) + p3.0 * (p1.1 - p2.1)) / 2.0
+    };
+    let total = area(a, b, c).abs();
+    let a1 = area(p, b, c).abs();
+    let a2 = area(a, p, c).abs();
+    let a3 = area(a, b, p).abs();
+    (total - (a1 + a2 + a3)).abs() <= 0.5
+}
+
+fn set_pixel(rgba: &mut [u8], size: usize, x: usize, y: usize, color: [u8; 4]) {
+    let index = (y * size + x) * 4;
+    if index + 3 < rgba.len() {
+        rgba[index..index + 4].copy_from_slice(&color);
+    }
 }
 
 fn section_frame(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut egui::Ui)) {
@@ -1439,9 +1785,15 @@ fn thumbnail_placeholder(ui: &mut egui::Ui, item: &GuiQueueItem) {
         .inner_margin(egui::Margin::same(6))
         .show(ui, |ui| {
             ui.allocate_ui(egui::vec2(70.0, 44.0), |ui| {
-                ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("▶").color(tint).size(20.0));
-                });
+                if let Some(texture) = &item.thumbnail_texture {
+                    ui.centered_and_justified(|ui| {
+                        ui.image((texture.id(), egui::vec2(66.0, 40.0)));
+                    });
+                } else {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(RichText::new("▶").color(tint).size(20.0));
+                    });
+                }
             });
         });
 }
@@ -1550,4 +1902,32 @@ fn pretty_title_from_url(url: &str) -> Cow<'_, str> {
     } else {
         Cow::Owned(display)
     }
+}
+
+fn download_thumbnail(url: &str) -> Result<DecodedThumbnail, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|error| format!("thumbnail client error: {error}"))?;
+    let bytes = client
+        .get(url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|error| format!("thumbnail request failed: {error}"))?
+        .bytes()
+        .map_err(|error| format!("thumbnail read failed: {error}"))?;
+    let image = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| format!("thumbnail format error: {error}"))?
+        .decode()
+        .map_err(|error| format!("thumbnail decode failed: {error}"))?
+        .thumbnail(160, 90)
+        .to_rgba8();
+    let width = image.width() as usize;
+    let height = image.height() as usize;
+    Ok(DecodedThumbnail {
+        rgba: image.into_raw(),
+        width,
+        height,
+    })
 }

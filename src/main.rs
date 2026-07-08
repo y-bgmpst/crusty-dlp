@@ -68,7 +68,10 @@ async fn main() -> Result<()> {
     if cli.dry_run && !app.queue.is_empty() {
         let downloader = Downloader::new("yt-dlp".into(), app.config.output_dir.clone());
         for item in &app.queue {
-            let args = downloader.arguments(&item.url, &app.mode, app.download_options(&item.url));
+            let options = app
+                .download_options(&item.url)
+                .map_err(anyhow::Error::msg)?;
+            let args = downloader.arguments(&item.url, &app.mode, options);
             println!("{}", downloader.display_command(&args));
         }
         return Ok(());
@@ -134,7 +137,14 @@ async fn start_next(app: &mut App, tx: mpsc::UnboundedSender<DownloadEvent>) {
         );
         return;
     }
-    let args = downloader.arguments(&item.url, &app.mode, app.download_options(&item.url));
+    let options = match app.download_options(&item.url) {
+        Ok(options) => options,
+        Err(error) => {
+            app.fail_item(item, &error);
+            return;
+        }
+    };
+    let args = downloader.arguments(&item.url, &app.mode, options);
     if app.dry_run {
         app.finish_dry_run(item, downloader.display_command(&args));
         return;

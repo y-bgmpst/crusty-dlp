@@ -13,6 +13,12 @@ concurrent_fragments = 4
 use_aria2 = false
 # Empty means unlimited. Examples: 5M, 900K, 1.5Mi
 rate_limit = ""
+# Empty means auto. PMVHaven will default to 60 seconds if left blank.
+socket_timeout = ""
+# Empty means auto. PMVHaven will default to 10 retries if left blank.
+retries = ""
+# Empty means auto. PMVHaven will default to 10 fragment retries if left blank.
+fragment_retries = ""
 # Number of simultaneous downloads in the GUI.
 max_active_downloads = 1
 # Expand supported playlist URLs such as YouTube playlists.
