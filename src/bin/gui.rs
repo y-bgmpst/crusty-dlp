@@ -2,11 +2,12 @@ use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
     path::PathBuf,
+    process::Command as StdCommand,
     sync::{
         mpsc::{self as std_mpsc, Receiver, TryRecvError},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use arboard::Clipboard;
@@ -32,6 +33,8 @@ const RED: Color32 = Color32::from_rgb(235, 87, 87);
 const AMBER: Color32 = Color32::from_rgb(217, 154, 34);
 const PANEL: Color32 = Color32::from_rgb(31, 36, 41);
 const PANEL_ALT: Color32 = Color32::from_rgb(36, 42, 48);
+const APP_ID: &str = "crusty-dlp";
+const THUMBNAIL_CACHE_LIMIT: usize = 96;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_GIT_SHA: &str = match option_env!("CRUSTY_GIT_SHA") {
     Some(value) => value,
@@ -95,6 +98,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(&app_title)
+            .with_app_id(APP_ID)
             .with_icon(app_icon())
             .with_inner_size([1280.0, 820.0])
             .with_min_inner_size([960.0, 660.0]),
@@ -145,9 +149,11 @@ fn app_icon() -> egui::IconData {
 }
 
 struct GuiQueueItem {
-    title: Option<String>,
-    url: String,
-    thumbnail_url: Option<String>,
+    title: Option<Box<str>>,
+    url: Box<str>,
+    thumbnail_url: Option<Box<str>>,
+    thumbnail_requested: bool,
+    thumbnail_failed: bool,
     thumbnail_image: Option<DecodedThumbnail>,
     thumbnail_texture: Option<egui::TextureHandle>,
     state: DownloadState,
@@ -172,10 +178,61 @@ struct ThumbnailRequest {
     url: String,
 }
 
+#[derive(Clone)]
 struct DecodedThumbnail {
     rgba: Vec<u8>,
     width: usize,
     height: usize,
+}
+
+#[derive(Clone)]
+struct ThumbnailCacheEntry {
+    image: Option<DecodedThumbnail>,
+    texture: Option<egui::TextureHandle>,
+}
+
+#[derive(Debug, Clone)]
+struct ToolDiagnostic {
+    label: &'static str,
+    path: Option<PathBuf>,
+    version: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeDiagnostics {
+    yt_dlp: ToolDiagnostic,
+    ffmpeg: ToolDiagnostic,
+    yt_dlp_ejs: ToolDiagnostic,
+    js_runtime: Option<ToolDiagnostic>,
+    plugin_dir: Option<PathBuf>,
+    yt_dlp_age_days: Option<i64>,
+    refreshed_at: Instant,
+}
+
+impl RuntimeDiagnostics {
+    fn placeholder() -> Self {
+        Self {
+            yt_dlp: ToolDiagnostic {
+                label: "yt-dlp",
+                path: None,
+                version: None,
+            },
+            ffmpeg: ToolDiagnostic {
+                label: "ffmpeg",
+                path: None,
+                version: None,
+            },
+            yt_dlp_ejs: ToolDiagnostic {
+                label: "yt-dlp-ejs",
+                path: None,
+                version: None,
+            },
+            js_runtime: None,
+            plugin_dir: None,
+            yt_dlp_age_days: None,
+            refreshed_at: Instant::now(),
+        }
+    }
 }
 
 struct GuiApp {
@@ -201,6 +258,12 @@ struct GuiApp {
     folder_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
     thumbnail_rx: Receiver<QueueThumbnailEvent>,
     thumbnail_request_tx: std_mpsc::Sender<ThumbnailRequest>,
+    thumbnail_cache: HashMap<String, ThumbnailCacheEntry>,
+    thumbnail_lru: VecDeque<String>,
+    thumbnail_cache_dir: Option<PathBuf>,
+    diagnostics: RuntimeDiagnostics,
+    diagnostics_rx: Receiver<RuntimeDiagnostics>,
+    diagnostics_refresh_pending: bool,
 }
 
 impl GuiApp {
@@ -225,10 +288,13 @@ impl GuiApp {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         let (thumbnail_tx, thumbnail_rx) = std_mpsc::channel();
         let (thumbnail_request_tx, thumbnail_request_rx) = std_mpsc::channel::<ThumbnailRequest>();
+        let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
         let thumbnail_request_rx = Arc::new(Mutex::new(thumbnail_request_rx));
+        let thumbnail_cache_dir = thumbnail_cache_directory();
         for _ in 0..4 {
             let request_rx = Arc::clone(&thumbnail_request_rx);
             let result_tx = thumbnail_tx.clone();
+            let cache_dir = thumbnail_cache_dir.clone();
             std::thread::spawn(move || loop {
                 let request = match request_rx.lock() {
                     Ok(receiver) => receiver.recv(),
@@ -237,7 +303,7 @@ impl GuiApp {
                 let Ok(request) = request else {
                     break;
                 };
-                let result = download_thumbnail(&request.url);
+                let result = download_thumbnail(&request.url, cache_dir.as_deref());
                 let _ = result_tx.send(QueueThumbnailEvent {
                     index: request.index,
                     result,
@@ -249,7 +315,7 @@ impl GuiApp {
         } else {
             "yt-dlp was not found in PATH or beside the application".to_owned()
         };
-        Self {
+        let mut app = Self {
             output_dir_text: config.output_dir.to_string_lossy().into_owned(),
             output_template_text: config.output_template.clone(),
             rate_limit_text: config.rate_limit.clone(),
@@ -272,7 +338,15 @@ impl GuiApp {
             folder_picker_rx: None,
             thumbnail_rx,
             thumbnail_request_tx,
-        }
+            thumbnail_cache: HashMap::new(),
+            thumbnail_lru: VecDeque::new(),
+            thumbnail_cache_dir,
+            diagnostics: RuntimeDiagnostics::placeholder(),
+            diagnostics_rx,
+            diagnostics_refresh_pending: false,
+        };
+        app.request_diagnostics_refresh(diagnostics_tx);
+        app
     }
 
     fn save_config(&mut self) {
@@ -418,9 +492,11 @@ impl GuiApp {
         }
         let index = self.queue.len();
         self.queue.push(GuiQueueItem {
-            title,
-            url: url.to_owned(),
-            thumbnail_url,
+            title: title.map(String::into_boxed_str),
+            url: url.to_owned().into_boxed_str(),
+            thumbnail_url: thumbnail_url.map(String::into_boxed_str),
+            thumbnail_requested: false,
+            thumbnail_failed: false,
             thumbnail_image: None,
             thumbnail_texture: None,
             state: DownloadState::Waiting,
@@ -428,19 +504,83 @@ impl GuiApp {
             progress_text: String::new(),
             error: None,
         });
-        self.request_thumbnail(index);
+        let _ = index;
     }
 
-    fn request_thumbnail(&self, index: usize) {
+    fn request_thumbnail(&mut self, index: usize) {
         let Some(item) = self.queue.get(index) else {
             return;
         };
+        if item.thumbnail_requested
+            || item.thumbnail_failed
+            || item.thumbnail_texture.is_some()
+            || item.thumbnail_image.is_some()
+        {
+            return;
+        }
         let Some(thumbnail_url) = item.thumbnail_url.clone() else {
             return;
         };
+        let thumbnail_key = thumbnail_url.to_string();
+        if let Some(entry) = self.thumbnail_cache.get(&thumbnail_key).cloned() {
+            self.touch_thumbnail_cache(&thumbnail_key);
+            if let Some(item) = self.queue.get_mut(index) {
+                if let Some(texture) = entry.texture {
+                    item.thumbnail_texture = Some(texture);
+                } else if let Some(image) = entry.image {
+                    item.thumbnail_image = Some(image);
+                }
+            }
+            return;
+        }
+        if let Some(item) = self.queue.get_mut(index) {
+            item.thumbnail_requested = true;
+        }
         let _ = self.thumbnail_request_tx.send(ThumbnailRequest {
             index,
-            url: thumbnail_url,
+            url: thumbnail_key,
+        });
+    }
+
+    fn touch_thumbnail_cache(&mut self, key: &str) {
+        self.thumbnail_lru.retain(|entry| entry != key);
+        self.thumbnail_lru.push_back(key.to_owned());
+        while self.thumbnail_lru.len() > THUMBNAIL_CACHE_LIMIT {
+            if let Some(expired) = self.thumbnail_lru.pop_front() {
+                self.thumbnail_cache.remove(&expired);
+            }
+        }
+    }
+
+    fn cache_thumbnail_image(&mut self, key: &str, image: DecodedThumbnail) {
+        let entry = self
+            .thumbnail_cache
+            .entry(key.to_owned())
+            .or_insert(ThumbnailCacheEntry {
+                image: None,
+                texture: None,
+            });
+        entry.image = Some(image);
+        self.touch_thumbnail_cache(key);
+    }
+
+    fn cache_thumbnail_texture(&mut self, key: &str, texture: egui::TextureHandle) {
+        let entry = self
+            .thumbnail_cache
+            .entry(key.to_owned())
+            .or_insert(ThumbnailCacheEntry {
+                image: None,
+                texture: None,
+            });
+        entry.texture = Some(texture);
+        entry.image = None;
+        self.touch_thumbnail_cache(key);
+    }
+
+    fn request_diagnostics_refresh(&mut self, tx: std_mpsc::Sender<RuntimeDiagnostics>) {
+        self.diagnostics_refresh_pending = true;
+        std::thread::spawn(move || {
+            let _ = tx.send(collect_runtime_diagnostics());
         });
     }
 
@@ -713,11 +853,12 @@ impl GuiApp {
                     self.status = "Download finished".into();
                 }
                 DownloadEvent::Failed(message) => {
+                    let message = friendly_error(&self.queue[job.index].url, &message);
                     self.queue[job.index].state = DownloadState::Failed;
                     self.queue[job.index].error = Some(message.clone());
                     self.active_downloads.remove(&job.index);
                     self.log(format!("ERROR: {message}"));
-                    self.status = "Download failed".into();
+                    self.status = message;
                 }
                 DownloadEvent::Cancelled => {
                     self.queue[job.index].state = DownloadState::Cancelled;
@@ -730,11 +871,32 @@ impl GuiApp {
         }
 
         while let Ok(event) = self.thumbnail_rx.try_recv() {
+            let thumbnail_url = self
+                .queue
+                .get(event.index)
+                .and_then(|item| item.thumbnail_url.as_deref().map(str::to_owned));
             if let Some(item) = self.queue.get_mut(event.index) {
-                if let Ok(image) = event.result {
-                    item.thumbnail_image = Some(image);
+                match event.result {
+                    Ok(image) => {
+                        item.thumbnail_requested = false;
+                        item.thumbnail_failed = false;
+                        item.thumbnail_image = Some(image.clone());
+                        if let Some(url) = thumbnail_url.as_deref() {
+                            self.cache_thumbnail_image(url, image);
+                        }
+                    }
+                    Err(_) => {
+                        item.thumbnail_requested = false;
+                        item.thumbnail_failed = true;
+                    }
                 }
             }
+        }
+
+        while let Ok(diagnostics) = self.diagnostics_rx.try_recv() {
+            self.diagnostics = diagnostics;
+            self.diagnostics_refresh_pending = false;
+            self.status = "Diagnostics refreshed".into();
         }
 
         if self.queue_running {
@@ -752,11 +914,23 @@ impl GuiApp {
     }
 
     fn ensure_thumbnail_textures(&mut self, ctx: &egui::Context) {
-        for (index, item) in self.queue.iter_mut().enumerate() {
-            if item.thumbnail_texture.is_some() {
+        for index in 0..self.queue.len() {
+            if self.queue[index].thumbnail_texture.is_some() {
                 continue;
             }
-            let Some(image) = item.thumbnail_image.take() else {
+            if let Some(url) = self.queue[index].thumbnail_url.as_deref() {
+                if let Some(entry) = self.thumbnail_cache.get(url) {
+                    if let Some(texture) = entry.texture.clone() {
+                        self.queue[index].thumbnail_texture = Some(texture);
+                        continue;
+                    }
+                }
+            }
+            let thumbnail_url = self.queue[index]
+                .thumbnail_url
+                .as_deref()
+                .map(str::to_owned);
+            let Some(image) = self.queue[index].thumbnail_image.take() else {
                 continue;
             };
             let texture = ctx.load_texture(
@@ -764,7 +938,10 @@ impl GuiApp {
                 egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba),
                 egui::TextureOptions::LINEAR,
             );
-            item.thumbnail_texture = Some(texture);
+            if let Some(url) = thumbnail_url.as_deref() {
+                self.cache_thumbnail_texture(url, texture.clone());
+            }
+            self.queue[index].thumbnail_texture = Some(texture);
         }
     }
 
@@ -1048,6 +1225,9 @@ impl GuiApp {
         section_frame(ui, "Advanced yt-dlp options", |ui| {
             self.advanced_settings_panel(ui)
         });
+
+        ui.add_space(14.0);
+        section_frame(ui, "Environment", |ui| self.diagnostics_panel(ui));
     }
 
     fn browse_output_dir(&mut self) {
@@ -1209,13 +1389,79 @@ impl GuiApp {
         ui.small("Blank keeps yt-dlp defaults, except PMVHaven uses 60 / 10 / 10.");
     }
 
+    fn diagnostics_panel(&mut self, ui: &mut egui::Ui) {
+        if ui
+            .add_enabled(
+                !self.diagnostics_refresh_pending,
+                egui::Button::new("Refresh diagnostics"),
+            )
+            .clicked()
+        {
+            let (tx, rx) = std_mpsc::channel();
+            self.diagnostics_rx = rx;
+            self.request_diagnostics_refresh(tx);
+        }
+        if self.diagnostics_refresh_pending {
+            ui.small("Refreshing diagnostics…");
+        } else {
+            ui.small(format!(
+                "Last refreshed: {}s ago",
+                self.diagnostics.refreshed_at.elapsed().as_secs()
+            ));
+        }
+        ui.add_space(8.0);
+        diagnostic_row(
+            ui,
+            &self.diagnostics.yt_dlp,
+            self.diagnostics.yt_dlp_age_days,
+        );
+        diagnostic_row(ui, &self.diagnostics.ffmpeg, None);
+        diagnostic_row(ui, &self.diagnostics.yt_dlp_ejs, None);
+        if let Some(runtime) = &self.diagnostics.js_runtime {
+            diagnostic_row(ui, runtime, None);
+        } else {
+            ui.label(RichText::new("js runtime: missing").color(AMBER));
+        }
+        ui.label(format!(
+            "plugins: {}",
+            self.diagnostics
+                .plugin_dir
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "not found".into())
+        ));
+        ui.add_space(8.0);
+        if self.diagnostics.yt_dlp.path.is_none() {
+            ui.label(RichText::new("Install yt-dlp").strong());
+            selectable_command(ui, "sudo pacman -S yt-dlp");
+        }
+        if self.diagnostics.ffmpeg.path.is_none() {
+            ui.label(RichText::new("Install ffmpeg for muxing / audio conversion").strong());
+            selectable_command(ui, "sudo pacman -S ffmpeg");
+        }
+        if self.diagnostics.yt_dlp_ejs.path.is_none() || self.diagnostics.js_runtime.is_none() {
+            ui.label(
+                RichText::new("Full YouTube support is incomplete")
+                    .color(AMBER)
+                    .strong(),
+            );
+            if self.diagnostics.yt_dlp_ejs.path.is_none() {
+                selectable_command(ui, "python -m pip install -U yt-dlp-ejs");
+            }
+            if self.diagnostics.js_runtime.is_none() {
+                selectable_command(ui, "sudo pacman -S deno");
+            }
+            ui.small("yt-dlp upstream expects yt-dlp-ejs plus a supported JavaScript runtime for full YouTube challenge handling.");
+        }
+    }
+
     fn queue_panel(&mut self, ui: &mut egui::Ui, max_height: f32) {
         section_frame(ui, &format!("Queue ({})", self.queue.len()), |ui| {
             let full_width = ui.available_width();
             let number_width = 22.0;
-            let thumb_width = 84.0;
-            let status_width = 112.0;
-            let progress_width = 170.0;
+            let thumb_width = if full_width < 760.0 { 72.0 } else { 84.0 };
+            let status_width = if full_width < 760.0 { 92.0 } else { 112.0 };
+            let progress_width = if full_width < 760.0 { 132.0 } else { 170.0 };
             let gap = 12.0;
             let info_width = (full_width
                 - number_width
@@ -1260,22 +1506,63 @@ impl GuiApp {
                 );
             });
             ui.separator();
-            egui::ScrollArea::vertical()
-                .max_height(max_height.max(120.0))
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    if self.queue.is_empty() {
-                        ui.add_space(50.0);
-                        ui.vertical_centered(|ui| {
-                            ui.label(RichText::new("Queue is empty").size(18.0));
-                            ui.label("Add one or more URLs to begin.");
-                        });
-                    }
-                    for (index, item) in self.queue.iter().enumerate() {
-                        queue_row(ui, index, item);
-                        ui.add_space(6.0);
-                    }
+            if self.queue.is_empty() {
+                ui.add_space(50.0);
+                ui.vertical_centered(|ui| {
+                    ui.label(RichText::new("Queue is empty").size(18.0));
+                    ui.label("Add one or more URLs to begin.");
                 });
+            } else {
+                egui::ScrollArea::vertical()
+                    .max_height(max_height.max(120.0))
+                    .auto_shrink([false, false])
+                    .show_viewport(ui, |ui, viewport| {
+                        let mut heights = Vec::with_capacity(self.queue.len());
+                        let mut total_height = 0.0f32;
+                        for item in &self.queue {
+                            let height = queue_row_height(item, full_width);
+                            heights.push(height);
+                            total_height += height;
+                        }
+
+                        let start_y = viewport.min.y.max(0.0);
+                        let end_y = viewport.max.y;
+                        let mut top_space = 0.0f32;
+                        let mut cursor = 0.0f32;
+                        let mut visible = Vec::new();
+
+                        for (index, height) in heights.iter().copied().enumerate() {
+                            let row_end = cursor + height;
+                            if row_end < start_y {
+                                top_space += height;
+                            } else if cursor <= end_y {
+                                visible.push((index, height));
+                            }
+                            cursor = row_end;
+                            if cursor > end_y && !visible.is_empty() {
+                                break;
+                            }
+                        }
+
+                        let visible_height: f32 = visible.iter().map(|(_, height)| *height).sum();
+                        let bottom_space = (total_height - top_space - visible_height).max(0.0);
+
+                        if top_space > 0.0 {
+                            ui.add_space(top_space);
+                        }
+
+                        for (index, _) in visible {
+                            self.request_thumbnail(index);
+                            let item = &self.queue[index];
+                            queue_row(ui, index, item);
+                            ui.add_space(6.0);
+                        }
+
+                        if bottom_space > 0.0 {
+                            ui.add_space(bottom_space);
+                        }
+                    });
+            }
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
@@ -1320,7 +1607,9 @@ impl GuiApp {
                                 );
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(&item.url).size(12.0).color(Color32::GRAY),
+                                        RichText::new(item.url.as_ref())
+                                            .size(12.0)
+                                            .color(Color32::GRAY),
                                     )
                                     .truncate(),
                                 );
@@ -1338,48 +1627,6 @@ impl GuiApp {
                     }
                 } else {
                     ui.label("No active downloads");
-                    let waiting_indices: Vec<_> = self
-                        .queue
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, item)| {
-                            (item.state == DownloadState::Waiting).then_some(index)
-                        })
-                        .collect();
-                    if !waiting_indices.is_empty() {
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Waiting items").strong());
-                        egui::ScrollArea::vertical()
-                            .max_height(92.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for index in waiting_indices {
-                                    if let Some(item) = self.queue.get(index) {
-                                        ui.horizontal(|ui| {
-                                            thumbnail_placeholder(ui, item);
-                                            ui.vertical(|ui| {
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(queue_item_title(item))
-                                                            .strong(),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                                ui.add(
-                                                    egui::Label::new(
-                                                        RichText::new(&item.url)
-                                                            .size(12.0)
-                                                            .color(Color32::GRAY),
-                                                    )
-                                                    .truncate(),
-                                                );
-                                            });
-                                        });
-                                        ui.add_space(6.0);
-                                    }
-                                }
-                            });
-                    }
                 }
 
                 ui.add_space(12.0);
@@ -1516,18 +1763,40 @@ impl eframe::App for GuiApp {
                     let executable = current_executable_path()
                         .map(|path| path.display().to_string())
                         .unwrap_or_else(|| "not found".into());
-                    let plugin_dir = resolved_plugin_directory()
+                    let plugin_dir = self
+                        .diagnostics
+                        .plugin_dir
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| "not found".into());
+                    let thumbnail_cache = self
+                        .thumbnail_cache_dir
+                        .as_ref()
                         .map(|path| path.display().to_string())
                         .unwrap_or_else(|| "not found".into());
                     ui.label(format!("exe: {executable}"));
                     ui.separator();
                     ui.label(format!("plugins: {plugin_dir}"));
+                    ui.separator();
+                    ui.label(format!("thumb-cache: {thumbnail_cache}"));
                 });
                 ui.horizontal(|ui| {
-                    let yt_dlp = dependency_path("yt-dlp")
+                    let yt_dlp = self
+                        .diagnostics
+                        .yt_dlp
+                        .path
+                        .as_ref()
                         .map(|path| path.display().to_string())
                         .unwrap_or_else(|| "not found".into());
                     ui.label(format!("yt-dlp: {yt_dlp}"));
+                    if let Some(version) = &self.diagnostics.yt_dlp.version {
+                        ui.separator();
+                        ui.label(format!("ver: {version}"));
+                    }
+                    if let Some(age_days) = self.diagnostics.yt_dlp_age_days {
+                        ui.separator();
+                        ui.label(format!("age: {age_days}d"));
+                    }
                     ui.separator();
                     ui.label(format!("crusty-dlp {} ({BUILD_PROFILE})", build_label()));
                     ui.separator();
@@ -1554,7 +1823,13 @@ impl eframe::App for GuiApp {
                 });
             });
         });
-        ctx.request_repaint_after(Duration::from_millis(100));
+        if !self.active_downloads.is_empty()
+            || self.folder_picker_rx.is_some()
+            || self.queue_running
+            || self.diagnostics_refresh_pending
+        {
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
     }
 }
 
@@ -1794,6 +2069,29 @@ fn section_frame(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut 
         });
 }
 
+fn diagnostic_row(ui: &mut egui::Ui, tool: &ToolDiagnostic, age_days: Option<i64>) {
+    let status = if tool.path.is_some() { GREEN } else { AMBER };
+    let mut line = format!(
+        "{}: {}",
+        tool.label,
+        tool.path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "not found".into())
+    );
+    if let Some(version) = &tool.version {
+        line.push_str(&format!(" · {version}"));
+    }
+    if let Some(age_days) = age_days {
+        line.push_str(&format!(" · {age_days}d old"));
+    }
+    ui.label(RichText::new(line).color(status));
+}
+
+fn selectable_command(ui: &mut egui::Ui, command: &str) {
+    ui.add(egui::Label::new(RichText::new(command).monospace()).selectable(true));
+}
+
 fn text_edit_with_context_menu(
     ui: &mut egui::Ui,
     value: &mut String,
@@ -1838,9 +2136,9 @@ fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
         .show(ui, |ui| {
             let full_width = ui.available_width();
             let number_width = 22.0;
-            let thumb_width = 84.0;
-            let status_width = 112.0;
-            let progress_width = 170.0;
+            let thumb_width = if full_width < 760.0 { 72.0 } else { 84.0 };
+            let status_width = if full_width < 760.0 { 92.0 } else { 112.0 };
+            let progress_width = if full_width < 760.0 { 132.0 } else { 170.0 };
             let gap = 12.0;
             let info_width = (full_width
                 - number_width
@@ -1849,6 +2147,69 @@ fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
                 - progress_width
                 - gap * 4.0)
                 .max(180.0);
+
+            if full_width < 700.0 {
+                ui.vertical(|ui| {
+                    ui.horizontal_top(|ui| {
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(number_width, 52.0),
+                            egui::Layout::top_down(egui::Align::Center),
+                            |ui| {
+                                ui.label(RichText::new(format!("{}", index + 1)).strong());
+                            },
+                        );
+
+                        thumbnail_placeholder(ui, item);
+
+                        ui.vertical(|ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(queue_item_title(item)).strong())
+                                    .truncate(),
+                            );
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(item.url.as_ref())
+                                        .size(12.0)
+                                        .color(Color32::GRAY),
+                                )
+                                .truncate(),
+                            );
+                        });
+
+                        status_badge(ui, item.state);
+                    });
+
+                    if let Some(error) = &item.error {
+                        ui.add_space(4.0);
+                        ui.add(
+                            egui::Label::new(RichText::new(error).color(RED).size(12.5)).truncate(),
+                        );
+                    }
+
+                    if matches!(
+                        item.state,
+                        DownloadState::Downloading | DownloadState::Finished
+                    ) {
+                        ui.add_space(6.0);
+                        ui.add(
+                            egui::ProgressBar::new(item.progress)
+                                .desired_width(ui.available_width())
+                                .show_percentage(),
+                        );
+                        if !item.progress_text.is_empty() {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&item.progress_text)
+                                        .size(12.0)
+                                        .color(Color32::GRAY),
+                                )
+                                .truncate(),
+                            );
+                        }
+                    }
+                });
+                return;
+            }
 
             ui.horizontal_top(|ui| {
                 ui.allocate_ui_with_layout(
@@ -1871,7 +2232,9 @@ fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
                         );
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&item.url).size(12.0).color(Color32::GRAY),
+                                RichText::new(item.url.as_ref())
+                                    .size(12.0)
+                                    .color(Color32::GRAY),
                             )
                             .truncate(),
                         );
@@ -2019,6 +2382,21 @@ fn queue_item_title(item: &GuiQueueItem) -> Cow<'_, str> {
         .unwrap_or_else(|| pretty_title_from_url(&item.url))
 }
 
+fn queue_row_height(item: &GuiQueueItem, full_width: f32) -> f32 {
+    let narrow = full_width < 700.0;
+    let mut height = if narrow { 88.0 } else { 72.0 };
+    if item.error.is_some() {
+        height += if narrow { 24.0 } else { 18.0 };
+    }
+    if matches!(
+        item.state,
+        DownloadState::Downloading | DownloadState::Finished
+    ) {
+        height += if narrow { 30.0 } else { 18.0 };
+    }
+    height + 6.0
+}
+
 fn pretty_title_from_url(url: &str) -> Cow<'_, str> {
     let trimmed = short_url(url);
     let slug = trimmed
@@ -2056,7 +2434,16 @@ fn pretty_title_from_url(url: &str) -> Cow<'_, str> {
     }
 }
 
-fn download_thumbnail(url: &str) -> Result<DecodedThumbnail, String> {
+fn download_thumbnail(
+    url: &str,
+    cache_dir: Option<&std::path::Path>,
+) -> Result<DecodedThumbnail, String> {
+    if let Some(cache_path) = cache_dir.and_then(|dir| thumbnail_cache_path(dir, url)) {
+        if cache_path.is_file() {
+            return decode_thumbnail_from_path(&cache_path);
+        }
+    }
+
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(15))
         .build()
@@ -2077,9 +2464,188 @@ fn download_thumbnail(url: &str) -> Result<DecodedThumbnail, String> {
         .to_rgba8();
     let width = image.width() as usize;
     let height = image.height() as usize;
+    let rgba = image.into_raw();
+
+    if let Some(cache_path) = cache_dir.and_then(|dir| thumbnail_cache_path(dir, url)) {
+        let _ = persist_thumbnail_cache(&cache_path, &rgba, width, height);
+    }
+
+    Ok(DecodedThumbnail {
+        rgba,
+        width,
+        height,
+    })
+}
+
+fn thumbnail_cache_directory() -> Option<PathBuf> {
+    directories::ProjectDirs::from("org", "crusty-dlp", "crusty-dlp").map(|dirs| {
+        let dir = dirs.cache_dir().join("thumbnails");
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+}
+
+fn thumbnail_cache_path(directory: &std::path::Path, url: &str) -> Option<PathBuf> {
+    let hash = stable_u64_hash(url.as_bytes());
+    Some(directory.join(format!("{hash:016x}.png")))
+}
+
+fn stable_u64_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn persist_thumbnail_cache(
+    path: &std::path::Path,
+    rgba: &[u8],
+    width: usize,
+    height: usize,
+) -> Result<(), String> {
+    image::save_buffer_with_format(
+        path,
+        rgba,
+        width as u32,
+        height as u32,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )
+    .map_err(|error| format!("thumbnail cache write failed: {error}"))
+}
+
+fn decode_thumbnail_from_path(path: &std::path::Path) -> Result<DecodedThumbnail, String> {
+    let image = ImageReader::open(path)
+        .map_err(|error| format!("thumbnail cache open failed: {error}"))?
+        .decode()
+        .map_err(|error| format!("thumbnail cache decode failed: {error}"))?
+        .to_rgba8();
+    let width = image.width() as usize;
+    let height = image.height() as usize;
     Ok(DecodedThumbnail {
         rgba: image.into_raw(),
         width,
         height,
     })
+}
+
+fn collect_runtime_diagnostics() -> RuntimeDiagnostics {
+    let yt_dlp = collect_tool_diagnostic("yt-dlp", &["--version"]);
+    let yt_dlp_age_days = yt_dlp.version.as_deref().and_then(yt_dlp_release_age_days);
+    RuntimeDiagnostics {
+        yt_dlp,
+        ffmpeg: collect_tool_diagnostic("ffmpeg", &["-version"]),
+        yt_dlp_ejs: collect_tool_diagnostic("yt-dlp-ejs", &["--version"]),
+        js_runtime: first_js_runtime(),
+        plugin_dir: resolved_plugin_directory(),
+        yt_dlp_age_days,
+        refreshed_at: Instant::now(),
+    }
+}
+
+fn collect_tool_diagnostic(name: &'static str, args: &[&str]) -> ToolDiagnostic {
+    let path = dependency_path(name);
+    let version = path
+        .as_deref()
+        .and_then(|path| command_first_line(path, args))
+        .map(|line| normalize_version_line(name, &line));
+    ToolDiagnostic {
+        label: name,
+        path,
+        version,
+    }
+}
+
+fn first_js_runtime() -> Option<ToolDiagnostic> {
+    ["deno", "node", "bun", "qjs", "quickjs"]
+        .into_iter()
+        .find_map(|name| {
+            let diagnostic = collect_tool_diagnostic(name, &["--version"]);
+            diagnostic.path.is_some().then_some(diagnostic)
+        })
+}
+
+fn command_first_line(executable: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = StdCommand::new(executable).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn normalize_version_line(name: &str, line: &str) -> String {
+    match name {
+        "ffmpeg" => line
+            .strip_prefix("ffmpeg version ")
+            .unwrap_or(line)
+            .to_owned(),
+        _ => line.to_owned(),
+    }
+}
+
+fn yt_dlp_release_age_days(version: &str) -> Option<i64> {
+    let release_date = parse_yt_dlp_release_date(version)?;
+    let current_date = current_utc_date()?;
+    Some(days_from_civil(current_date) - days_from_civil(release_date))
+}
+
+fn parse_yt_dlp_release_date(version: &str) -> Option<(i32, u32, u32)> {
+    let parts: Vec<_> = version.trim().split('.').take(3).collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    Some((
+        parts[0].parse().ok()?,
+        parts[1].parse().ok()?,
+        parts[2].parse().ok()?,
+    ))
+}
+
+fn current_utc_date() -> Option<(i32, u32, u32)> {
+    command_text("date", &["-u", "+%Y-%m-%d"])
+        .or_else(|| {
+            command_text(
+                "powershell",
+                &["-NoProfile", "-Command", "Get-Date -Format 'yyyy-MM-dd'"],
+            )
+        })
+        .and_then(|value| {
+            let parts: Vec<_> = value.trim().split('-').collect();
+            if parts.len() != 3 {
+                return None;
+            }
+            Some((
+                parts[0].parse().ok()?,
+                parts[1].parse().ok()?,
+                parts[2].parse().ok()?,
+            ))
+        })
+}
+
+fn command_text(program: &str, args: &[&str]) -> Option<String> {
+    let output = StdCommand::new(program).args(args).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let trimmed = stdout.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_owned())
+}
+
+fn days_from_civil((year, month, day): (i32, u32, u32)) -> i64 {
+    let year = year - i32::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = month as i32;
+    let day = day as i32;
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    (era * 146097 + doe - 719468) as i64
 }

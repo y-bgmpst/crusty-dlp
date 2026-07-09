@@ -165,8 +165,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          set -euo pipefail
+          mapfile -t assets < <(find dist -maxdepth 2 -type f | sort)
+          test "${#assets[@]}" -gt 0
           gh release create "$GITHUB_REF_NAME" \
             --repo "$GITHUB_REPOSITORY" \
             --generate-notes \
             --title "crusty-dlp $GITHUB_REF_NAME" \
-            dist/*
+            "${assets[@]}"
