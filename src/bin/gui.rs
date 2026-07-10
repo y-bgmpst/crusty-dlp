@@ -246,7 +246,7 @@ impl RuntimeDiagnostics {
                 version: None,
             },
             yt_dlp_ejs: ToolDiagnostic {
-                label: "yt-dlp-ejs",
+                label: "yt-dlp-ejs package",
                 path: None,
                 version: None,
             },
@@ -2830,7 +2830,7 @@ fn collect_runtime_diagnostics() -> RuntimeDiagnostics {
     RuntimeDiagnostics {
         yt_dlp,
         ffmpeg: collect_tool_diagnostic("ffmpeg", &["-version"]),
-        yt_dlp_ejs: collect_tool_diagnostic("yt-dlp-ejs", &["--version"]),
+        yt_dlp_ejs: collect_ejs_diagnostic(),
         js_runtime: first_js_runtime(),
         plugin_dir: resolved_plugin_directory(),
         yt_dlp_age_days,
@@ -2848,6 +2848,23 @@ fn collect_tool_diagnostic(name: &'static str, args: &[&str]) -> ToolDiagnostic 
         label: name,
         path,
         version,
+    }
+}
+
+fn collect_ejs_diagnostic() -> ToolDiagnostic {
+    const PROBE: &str =
+        "import importlib.util; spec=importlib.util.find_spec('yt_dlp_ejs'); print(spec.origin if spec and spec.origin else '')";
+    let path = ["python3", "python"]
+        .into_iter()
+        .filter_map(dependency_path)
+        .find_map(|python| {
+            let origin = command_first_line(&python, &["-c", PROBE])?;
+            (!origin.is_empty() && origin != "None").then(|| PathBuf::from(origin))
+        });
+    ToolDiagnostic {
+        label: "yt-dlp-ejs package",
+        path,
+        version: None,
     }
 }
 
