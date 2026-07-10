@@ -2290,7 +2290,7 @@ fn section_frame(ui: &mut egui::Ui, title: &str, add_contents: impl FnOnce(&mut 
     egui::Frame::group(ui.style())
         .fill(PANEL)
         .inner_margin(egui::Margin::same(14))
-        .stroke(egui::Stroke::new(1.0, Color32::from_gray(60)))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_gray(60)))
         .corner_radius(10.0)
         .show(ui, |ui| {
             ui.label(RichText::new(title).strong().size(18.0));
@@ -2369,7 +2369,7 @@ fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
     egui::Frame::group(ui.style())
         .fill(PANEL_ALT)
         .inner_margin(egui::Margin::same(12))
-        .stroke(egui::Stroke::new(1.0, Color32::from_gray(54)))
+        .stroke(egui::Stroke::new(1.0_f32, Color32::from_gray(54)))
         .corner_radius(10.0)
         .show(ui, |ui| {
             ui.set_min_height((expected_outer_height - 24.0).max(0.0));
@@ -2534,7 +2534,7 @@ fn thumbnail_placeholder(ui: &mut egui::Ui, item: &GuiQueueItem) {
     };
     egui::Frame::group(ui.style())
         .fill(Color32::from_black_alpha(24))
-        .stroke(egui::Stroke::new(1.0, tint))
+        .stroke(egui::Stroke::new(1.0_f32, tint))
         .corner_radius(8.0)
         .inner_margin(egui::Margin::same(6))
         .show(ui, |ui| {
@@ -2556,7 +2556,7 @@ fn status_badge(ui: &mut egui::Ui, state: DownloadState) {
     let color = state_color(state);
     egui::Frame::new()
         .fill(color.gamma_multiply(0.14))
-        .stroke(egui::Stroke::new(1.0, color))
+        .stroke(egui::Stroke::new(1.0_f32, color))
         .corner_radius(999.0)
         .inner_margin(egui::Margin::symmetric(10, 4))
         .show(ui, |ui| {
