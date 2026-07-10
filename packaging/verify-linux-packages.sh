@@ -29,13 +29,24 @@ trap 'rm -rf "$tmp"' EXIT
 verify_tree() {
     local root=$1
     local prefix="$root/usr"
-    test -x "$prefix/bin/crusty-dlp"
-    test -x "$prefix/bin/crusty-dlp-gui"
-    test -f "$prefix/share/applications/crusty-dlp.desktop"
-    test -f "$prefix/share/icons/hicolor/scalable/apps/crusty-dlp.svg"
-    test -f "$prefix/share/icons/hicolor/48x48/apps/crusty-dlp.png"
-    test -f "$prefix/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/pmvhaven.py"
-    test -f "$prefix/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/spankbang.py"
+    require_file() {
+        local path=$1
+        local mode=${2:-file}
+        if [[ $mode == executable && ! -x $path ]]; then
+            echo "Missing executable: $path" >&2
+            return 1
+        elif [[ $mode == file && ! -f $path ]]; then
+            echo "Missing file: $path" >&2
+            return 1
+        fi
+    }
+    require_file "$prefix/bin/crusty-dlp" executable
+    require_file "$prefix/bin/crusty-dlp-gui" executable
+    require_file "$prefix/share/applications/crusty-dlp.desktop"
+    require_file "$prefix/share/icons/hicolor/scalable/apps/crusty-dlp.svg"
+    require_file "$prefix/share/icons/hicolor/48x48/apps/crusty-dlp.png"
+    require_file "$prefix/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/pmvhaven.py"
+    require_file "$prefix/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/spankbang.py"
 
     if command -v desktop-file-validate >/dev/null 2>&1; then
         desktop-file-validate "$prefix/share/applications/crusty-dlp.desktop"
@@ -65,12 +76,12 @@ smoke_gui() {
     local root=$1
     local log=$2
     set +e
-    timeout --signal=TERM 8s env WINIT_UNIX_BACKEND=x11 HOME="$tmp/home" \
+    timeout --signal=TERM --kill-after=2s 8s env WINIT_UNIX_BACKEND=x11 HOME="$tmp/home" \
         XDG_CONFIG_HOME="$tmp/config" "$root/usr/bin/crusty-dlp-gui" >"$log" 2>&1
     local status=$?
     set -e
     # A GUI has no automatic exit path; timeout is the expected result.
-    [[ $status -eq 124 || $status -eq 143 ]] || {
+    [[ $status -eq 124 || $status -eq 137 || $status -eq 143 ]] || {
         cat "$log" >&2
         echo "GUI smoke test failed with exit code $status" >&2
         return 1
@@ -82,7 +93,9 @@ if ((check_x11)); then
     smoke_gui "$extract_deb" "$tmp/x11.log"
     smoke_gui "$extract_rpm" "$tmp/x11-rpm.log"
     x11_log="$tmp/x11-identity.log"
-    WINIT_UNIX_BACKEND=x11 "$extract_deb/usr/bin/crusty-dlp-gui" >"$x11_log" 2>&1 &
+    timeout --signal=TERM --kill-after=2s 12s env WINIT_UNIX_BACKEND=x11 \
+        HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" \
+        "$extract_deb/usr/bin/crusty-dlp-gui" >"$x11_log" 2>&1 &
     gui_pid=$!
     found=0
     for _ in $(seq 1 80); do
