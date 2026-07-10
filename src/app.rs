@@ -5,8 +5,8 @@ use tokio::sync::oneshot;
 use crate::{
     config::Config,
     downloader::{
-        resolve_network_tuning, supports_playlist_expansion, validate_output_template,
-        validate_rate_limit, DownloadEvent, DownloadOptions,
+        resolve_network_tuning, supports_playlist_expansion, validate_extractor_args,
+        validate_output_template, validate_rate_limit, DownloadEvent, DownloadOptions,
     },
     errors::AppError,
     search::{open_platform_search, SearchPlatform},
@@ -329,6 +329,7 @@ impl App {
     pub fn download_options<'a>(&'a self, url: &str) -> Result<DownloadOptions<'a>, String> {
         validate_output_template(&self.config.output_template)?;
         validate_rate_limit(&self.config.rate_limit)?;
+        validate_extractor_args(&self.config.extractor_args)?;
         let tuning = resolve_network_tuning(
             url,
             &self.config.socket_timeout,
@@ -349,6 +350,8 @@ impl App {
             socket_timeout: tuning.socket_timeout,
             retries: tuning.retries,
             fragment_retries: tuning.fragment_retries,
+            extractor_args: (!self.config.extractor_args.trim().is_empty())
+                .then_some(self.config.extractor_args.trim()),
             playlist_subfolder: None,
             playlist_subfolders: self.config.playlist_subfolders
                 && supports_playlist_expansion(url),

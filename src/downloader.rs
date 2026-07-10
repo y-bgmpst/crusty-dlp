@@ -48,6 +48,7 @@ pub struct DownloadOptions<'a> {
     pub socket_timeout: Option<u32>,
     pub retries: Option<u32>,
     pub fragment_retries: Option<u32>,
+    pub extractor_args: Option<&'a str>,
     pub playlist_subfolder: Option<&'a str>,
     pub playlist_subfolders: bool,
     pub embed_metadata: bool,
@@ -74,6 +75,7 @@ impl Default for DownloadOptions<'_> {
             socket_timeout: None,
             retries: None,
             fragment_retries: None,
+            extractor_args: None,
             playlist_subfolder: None,
             playlist_subfolders: false,
             embed_metadata: false,
@@ -104,6 +106,9 @@ impl Downloader {
         validate_output_template(output_template)?;
         if let Some(rate_limit) = options.rate_limit {
             validate_rate_limit(rate_limit)?;
+        }
+        if let Some(extractor_args) = options.extractor_args {
+            validate_extractor_args(extractor_args)?;
         }
         let concurrent_fragments = options.concurrent_fragments.clamp(1, 16);
         let output_template = if let Some(folder) = options.playlist_subfolder {
@@ -146,6 +151,10 @@ impl Downloader {
         if let Some(fragment_retries) = options.fragment_retries {
             args.push(OsString::from("--fragment-retries"));
             args.push(OsString::from(fragment_retries.to_string()));
+        }
+        if let Some(extractor_args) = options.extractor_args.filter(|value| !value.is_empty()) {
+            args.push(OsString::from("--extractor-args"));
+            args.push(OsString::from(extractor_args));
         }
         if options.embed_metadata {
             args.push(OsString::from("--embed-metadata"));
@@ -811,6 +820,13 @@ pub fn validate_rate_limit(value: &str) -> Result<(), String> {
     }
 }
 
+pub fn validate_extractor_args(value: &str) -> Result<(), String> {
+    if value.contains('\0') || value.contains('\n') || value.contains('\r') {
+        return Err("Extractor arguments cannot contain NUL or newline characters".into());
+    }
+    Ok(())
+}
+
 pub fn validate_socket_timeout(value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1224,6 +1240,12 @@ mod tests {
         assert!(validate_rate_limit("1.5Mi").is_ok());
         assert!(validate_rate_limit("fast").is_err());
         assert!(validate_rate_limit("5MBps").is_err());
+    }
+
+    #[test]
+    fn validates_extractor_args_as_one_safe_value() {
+        assert!(validate_extractor_args("youtube:player_client=default").is_ok());
+        assert!(validate_extractor_args("youtube:player_client=default\n--exec").is_err());
     }
 
     #[test]

@@ -270,6 +270,7 @@ struct GuiApp {
     socket_timeout_text: String,
     retries_text: String,
     fragment_retries_text: String,
+    extractor_args_text: String,
     mode: DownloadMode,
     queue: Vec<GuiQueueItem>,
     next_queue_id: u64,
@@ -414,6 +415,7 @@ impl GuiApp {
             socket_timeout_text: config.socket_timeout.clone(),
             retries_text: config.retries.clone(),
             fragment_retries_text: config.fragment_retries.clone(),
+            extractor_args_text: config.extractor_args.clone(),
             search_query: String::new(),
             config,
             config_path,
@@ -1536,6 +1538,20 @@ impl GuiApp {
         }
         ui.small("Tags are copied only when the extractor reports them from the source page.");
 
+        ui.add_space(8.0);
+        ui.label(RichText::new("Extractor arguments").strong());
+        let response = text_edit_with_context_menu(
+            ui,
+            &mut self.extractor_args_text,
+            "e.g. youtube:player_client=default",
+            f32::INFINITY,
+        );
+        if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
+            self.config.extractor_args = self.extractor_args_text.trim().to_owned();
+            self.save_config();
+        }
+        ui.small("Passed as one safe --extractor-args value; leave blank for yt-dlp defaults.");
+
         ui.horizontal(|ui| {
             ui.label("Speed limit");
             let response = text_edit_with_context_menu(
@@ -2055,6 +2071,7 @@ struct OwnedDownloadOptions {
     socket_timeout: Option<u32>,
     retries: Option<u32>,
     fragment_retries: Option<u32>,
+    extractor_args: Option<String>,
     playlist_subfolder: Option<String>,
     playlist_subfolders: bool,
     embed_metadata: bool,
@@ -2100,6 +2117,8 @@ impl OwnedDownloadOptions {
             socket_timeout: tuning.socket_timeout,
             retries: tuning.retries,
             fragment_retries: tuning.fragment_retries,
+            extractor_args: (!config.extractor_args.trim().is_empty())
+                .then(|| config.extractor_args.trim().to_owned()),
             playlist_subfolder: playlist_subfolder.map(str::to_owned),
             // GUI playlist expansion supplies an explicit sanitized folder per
             // queue item; do not add %(playlist_title)s to direct-video jobs.
@@ -2121,6 +2140,7 @@ impl OwnedDownloadOptions {
             socket_timeout: self.socket_timeout,
             retries: self.retries,
             fragment_retries: self.fragment_retries,
+            extractor_args: self.extractor_args.as_deref(),
             playlist_subfolder: self.playlist_subfolder.as_deref(),
             playlist_subfolders: self.playlist_subfolders,
             embed_metadata: self.embed_metadata,
