@@ -1101,9 +1101,12 @@ mod tests {
         assert!(args
             .windows(2)
             .any(|pair| pair[0] == "--limit-rate" && pair[1] == "5M"));
-        assert!(args.windows(2).any(|pair| {
-            pair[0] == "--output" && pair[1] == "/tmp/out/custom/%(title)s.%(ext)s"
-        }));
+        let expected_output = PathBuf::from("/tmp/out")
+            .join("custom/%(title)s.%(ext)s")
+            .into_os_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--output" && pair[1] == expected_output));
     }
 
     #[test]
@@ -1121,9 +1124,12 @@ mod tests {
                 },
             )
             .unwrap();
-        assert!(args.windows(2).any(|pair| {
-            pair[0] == "--output" && pair[1] == "/tmp/out/A_B_ playlist/%(title)s [%(id)s].%(ext)s"
-        }));
+        let expected_output = PathBuf::from("/tmp/out")
+            .join("A_B_ playlist/%(title)s [%(id)s].%(ext)s")
+            .into_os_string();
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "--output" && pair[1] == expected_output));
         assert!(args.contains(&OsString::from("--embed-metadata")));
         assert!(args.contains(&OsString::from("--write-info-json")));
         assert!(args.contains(&OsString::from("%(tags, ,)s:%(meta_comment)s")));
