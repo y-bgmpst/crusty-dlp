@@ -19,6 +19,9 @@ socket_timeout = ""
 retries = ""
 # Empty means auto. PMVHaven will default to 10 fragment retries if left blank.
 fragment_retries = ""
+playlist_subfolders = true
+embed_metadata = false
+write_info_json = false
 # Number of simultaneous downloads in the GUI.
 max_active_downloads = 1
 # Expand supported playlist URLs such as YouTube playlists.

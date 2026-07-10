@@ -72,7 +72,9 @@ async fn main() -> Result<()> {
             let options = app
                 .download_options(&item.url)
                 .map_err(anyhow::Error::msg)?;
-            let args = downloader.arguments(&item.url, &app.mode, options);
+            let args = downloader
+                .arguments(&item.url, &app.mode, options)
+                .map_err(anyhow::Error::msg)?;
             println!("{}", downloader.display_command(&args));
         }
         return Ok(());
@@ -126,8 +128,16 @@ async fn start_next(app: &mut App, tx: mpsc::UnboundedSender<DownloadEvent>) {
             return;
         }
     };
-    if app.mode.needs_ffmpeg() && dependency_path("ffmpeg").is_none() {
-        app.fail_item(item, "ffmpeg is required for this download type");
+    if (app.mode.needs_ffmpeg() || app.config.embed_metadata) && dependency_path("ffmpeg").is_none()
+    {
+        app.fail_item(
+            item,
+            if app.config.embed_metadata && !app.mode.needs_ffmpeg() {
+                "ffmpeg is required to embed metadata"
+            } else {
+                "ffmpeg is required for this download type"
+            },
+        );
         return;
     }
 
@@ -146,7 +156,13 @@ async fn start_next(app: &mut App, tx: mpsc::UnboundedSender<DownloadEvent>) {
             return;
         }
     };
-    let args = downloader.arguments(&item.url, &app.mode, options);
+    let args = match downloader.arguments(&item.url, &app.mode, options) {
+        Ok(args) => args,
+        Err(error) => {
+            app.fail_item(item, &error);
+            return;
+        }
+    };
     if app.dry_run {
         app.finish_dry_run(item, downloader.display_command(&args));
         return;

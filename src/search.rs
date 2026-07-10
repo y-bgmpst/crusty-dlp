@@ -23,10 +23,11 @@ pub enum SearchPlatform {
     DrTuber,
     TnaFlix,
     Txxx,
+    ThisVid,
 }
 
 impl SearchPlatform {
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::YouTube,
         Self::Vimeo,
         Self::Dailymotion,
@@ -48,6 +49,7 @@ impl SearchPlatform {
         Self::DrTuber,
         Self::TnaFlix,
         Self::Txxx,
+        Self::ThisVid,
     ];
 
     pub fn label(self) -> &'static str {
@@ -73,6 +75,7 @@ impl SearchPlatform {
             Self::DrTuber => "DrTuber",
             Self::TnaFlix => "TNAFlix",
             Self::Txxx => "TXXX",
+            Self::ThisVid => "ThisVid",
         }
     }
 
@@ -99,6 +102,7 @@ impl SearchPlatform {
             Self::DrTuber => "drtuber",
             Self::TnaFlix => "tnaflix",
             Self::Txxx => "txxx",
+            Self::ThisVid => "thisvid",
         }
     }
 
@@ -124,6 +128,7 @@ impl SearchPlatform {
             "drtuber" => Self::DrTuber,
             "tnaflix" => Self::TnaFlix,
             "txxx" => Self::Txxx,
+            "thisvid" => Self::ThisVid,
             _ => Self::YouTube,
         }
     }
@@ -164,6 +169,7 @@ impl SearchPlatform {
             Self::DrTuber => format!("https://www.drtuber.com/search/videos/{encoded}"),
             Self::TnaFlix => format!("https://www.tnaflix.com/search/{encoded}"),
             Self::Txxx => format!("https://txxx.com/search/{encoded}"),
+            Self::ThisVid => format!("https://thisvid.com/search/?q={encoded}"),
         }
     }
 }
@@ -208,6 +214,10 @@ mod tests {
         assert_eq!(
             SearchPlatform::PornHub.search_url("hello"),
             "https://www.pornhub.com/video/search?search=hello"
+        );
+        assert_eq!(
+            SearchPlatform::ThisVid.search_url("alpha popper"),
+            "https://thisvid.com/search/?q=alpha%20popper"
         );
     }
 }

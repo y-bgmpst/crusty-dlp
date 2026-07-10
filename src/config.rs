@@ -1,5 +1,6 @@
 use std::{
     fs,
+    io::Write,
     path::{Path, PathBuf},
 };
 
@@ -24,6 +25,9 @@ pub struct Config {
     pub socket_timeout: String,
     pub retries: String,
     pub fragment_retries: String,
+    pub playlist_subfolders: bool,
+    pub embed_metadata: bool,
+    pub write_info_json: bool,
     pub max_active_downloads: u8,
     pub allow_playlists: bool,
     pub search_platform: String,
@@ -49,6 +53,9 @@ impl Default for Config {
             socket_timeout: String::new(),
             retries: String::new(),
             fragment_retries: String::new(),
+            playlist_subfolders: true,
+            embed_metadata: false,
+            write_info_json: false,
             max_active_downloads: 1,
             allow_playlists: true,
             search_platform: "youtube".into(),
@@ -80,8 +87,32 @@ impl Config {
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self)?;
-        fs::write(path, text).with_context(|| format!("could not write {}", path.display()))
+        let temporary = path.with_extension("toml.tmp");
+        let mut file = fs::File::create(&temporary)
+            .with_context(|| format!("could not create {}", temporary.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("could not write {}", temporary.display()))?;
+        file.sync_all()
+            .with_context(|| format!("could not sync {}", temporary.display()))?;
+        drop(file);
+        replace_file(&temporary, path)
+            .with_context(|| format!("could not replace {}", path.display()))
     }
+}
+
+#[cfg(not(windows))]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(windows)]
+fn replace_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    // Windows rename does not replace an existing destination. Preserve the
+    // complete temporary file until it is ready, then use the platform fallback.
+    if destination.exists() {
+        fs::remove_file(destination)?;
+    }
+    fs::rename(source, destination)
 }
 
 #[cfg(test)]
@@ -110,6 +141,9 @@ mod tests {
         assert_eq!(config.socket_timeout, "");
         assert_eq!(config.retries, "");
         assert_eq!(config.fragment_retries, "");
+        assert!(config.playlist_subfolders);
+        assert!(!config.embed_metadata);
+        assert!(!config.write_info_json);
         assert_eq!(config.max_active_downloads, 1);
         assert!(config.allow_playlists);
         assert_eq!(config.search_platform, "youtube");

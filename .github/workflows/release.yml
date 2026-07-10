@@ -17,7 +17,7 @@ jobs:
       - name: Install Linux packaging tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y rpm
+          sudo apt-get install -y cpio desktop-file-utils rpm weston x11-utils xvfb dbus-x11
           cargo install cargo-deb --locked
           cargo install cargo-generate-rpm --locked
       - run: cargo build --release --locked --bins
@@ -29,6 +29,34 @@ jobs:
           mkdir -p dist/packages
           find target/debian -maxdepth 1 -type f -name '*.deb' -exec cp {} dist/packages/ \;
           find target/generate-rpm -maxdepth 1 -type f -name '*.rpm' -exec cp {} dist/packages/ \;
+      - name: Verify Linux package layout and desktop identity
+        run: |
+          set -euo pipefail
+          deb=$(find dist/packages -maxdepth 1 -type f -name '*.deb' | head -n 1)
+          rpm=$(find dist/packages -maxdepth 1 -type f -name '*.rpm' | head -n 1)
+          test -n "$deb" && test -n "$rpm"
+          packaging/verify-linux-packages.sh --deb "$deb" --rpm "$rpm"
+          xvfb-run -a packaging/verify-linux-packages.sh --deb "$deb" --rpm "$rpm" --x11
+      - name: Verify Wayland app identity
+        run: |
+          set -euo pipefail
+          deb=$(find dist/packages -maxdepth 1 -type f -name '*.deb' | head -n 1)
+          rpm=$(find dist/packages -maxdepth 1 -type f -name '*.rpm' | head -n 1)
+          runtime="$RUNNER_TEMP/crusty-wayland"
+          mkdir -p "$runtime"
+          chmod 700 "$runtime"
+          DEB="$deb" RPM="$rpm" XDG_RUNTIME_DIR="$runtime" dbus-run-session -- bash -c '
+            set -euo pipefail
+            weston --backend=headless-backend.so --renderer=pixman --socket=wayland-1 --idle-time=0 >"$RUNNER_TEMP/weston.log" 2>&1 &
+            weston_pid=$!
+            trap "kill $weston_pid 2>/dev/null || true" EXIT
+            for _ in $(seq 1 40); do
+              test -S "$XDG_RUNTIME_DIR/wayland-1" && break
+              sleep 0.25
+            done
+            test -S "$XDG_RUNTIME_DIR/wayland-1"
+            WAYLAND_DISPLAY=wayland-1 packaging/verify-linux-packages.sh --deb "$DEB" --rpm "$RPM" --wayland
+          '
       - name: Package Linux bundle
         run: |
           set -euo pipefail

@@ -298,6 +298,9 @@ rate_limit = ""
 socket_timeout = ""
 retries = ""
 fragment_retries = ""
+playlist_subfolders = true
+embed_metadata = false
+write_info_json = false
 max_active_downloads = 1
 allow_playlists = true
 search_platform = "youtube"
@@ -308,6 +311,12 @@ gui_opacity = 0.96
 The browser-search launcher opens the selected platform's normal search page in
 your default browser. It does not scrape or embed site search results inside
 crusty-dlp.
+
+When playlist subfolders are enabled, expanded playlists are stored under a
+sanitized folder named after the playlist. `embed_metadata` asks yt-dlp/ffmpeg
+to embed metadata, while `write_info_json` keeps the complete extractor result
+next to the media file. Site tags are copied only when the extractor publishes
+them; crusty-dlp does not infer sensitive categories from titles or images.
 
 ## Troubleshooting
 

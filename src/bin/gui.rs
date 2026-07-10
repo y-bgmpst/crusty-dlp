@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
+    io::Read,
     path::PathBuf,
     process::Command as StdCommand,
     sync::{
@@ -16,10 +17,10 @@ use crusty_dlp::{
     config::Config,
     downloader::{
         available_impersonation_targets, current_executable_path, dependency_path,
-        expand_playlist_urls, resolve_network_tuning, resolved_plugin_directory,
-        supports_playlist_expansion, validate_output_template, validate_rate_limit,
-        validate_retry_count, validate_socket_timeout, DownloadEvent, DownloadOptions, Downloader,
-        PlaylistEntry,
+        expand_playlist_urls, playlist_title, resolve_network_tuning, resolved_plugin_directory,
+        sanitize_filename_component, supports_playlist_expansion, validate_output_template,
+        validate_rate_limit, validate_retry_count, validate_socket_timeout, DownloadEvent,
+        DownloadOptions, Downloader, PlaylistEntry,
     },
     search::{open_platform_search, SearchPlatform},
 };
@@ -35,6 +36,8 @@ const PANEL: Color32 = Color32::from_rgb(31, 36, 41);
 const PANEL_ALT: Color32 = Color32::from_rgb(36, 42, 48);
 const APP_ID: &str = "crusty-dlp";
 const THUMBNAIL_CACHE_LIMIT: usize = 96;
+const THUMBNAIL_RESPONSE_LIMIT: u64 = 5 * 1024 * 1024;
+const THUMBNAIL_DISK_CACHE_LIMIT: u64 = 128 * 1024 * 1024;
 const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_GIT_SHA: &str = match option_env!("CRUSTY_GIT_SHA") {
     Some(value) => value,
@@ -149,9 +152,11 @@ fn app_icon() -> egui::IconData {
 }
 
 struct GuiQueueItem {
+    id: u64,
     title: Option<Box<str>>,
     url: Box<str>,
     thumbnail_url: Option<Box<str>>,
+    playlist_folder: Option<Box<str>>,
     thumbnail_requested: bool,
     thumbnail_failed: bool,
     thumbnail_image: Option<DecodedThumbnail>,
@@ -164,18 +169,36 @@ struct GuiQueueItem {
 
 #[derive(Debug)]
 struct JobEvent {
-    index: usize,
+    id: u64,
     event: DownloadEvent,
 }
 
+struct DownloadRequest {
+    id: u64,
+    downloader: Downloader,
+    args: Vec<std::ffi::OsString>,
+    cancel_rx: oneshot::Receiver<()>,
+}
+
 struct QueueThumbnailEvent {
-    index: usize,
+    id: u64,
     result: Result<DecodedThumbnail, String>,
 }
 
 struct ThumbnailRequest {
-    index: usize,
+    id: u64,
     url: String,
+}
+
+struct PlaylistRequest {
+    executable: PathBuf,
+    url: String,
+}
+
+struct PlaylistExpansionEvent {
+    url: String,
+    playlist_title: Option<String>,
+    result: Result<Option<Vec<PlaylistEntry>>, String>,
 }
 
 #[derive(Clone)]
@@ -238,6 +261,7 @@ impl RuntimeDiagnostics {
 struct GuiApp {
     config: Config,
     config_path: Option<PathBuf>,
+    config_load_error: Option<String>,
     input: String,
     search_query: String,
     output_dir_text: String,
@@ -248,18 +272,26 @@ struct GuiApp {
     fragment_retries_text: String,
     mode: DownloadMode,
     queue: Vec<GuiQueueItem>,
+    next_queue_id: u64,
+    queue_row_offsets: Vec<f32>,
+    queue_layout_width: f32,
+    queue_layout_dirty: bool,
     queue_running: bool,
-    active_downloads: HashMap<usize, oneshot::Sender<()>>,
-    event_tx: mpsc::UnboundedSender<JobEvent>,
+    active_downloads: HashMap<u64, oneshot::Sender<()>>,
     event_rx: mpsc::UnboundedReceiver<JobEvent>,
+    download_request_tx: mpsc::UnboundedSender<DownloadRequest>,
     impersonation_targets: Vec<String>,
     logs: VecDeque<String>,
     status: String,
     folder_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
     thumbnail_rx: Receiver<QueueThumbnailEvent>,
     thumbnail_request_tx: std_mpsc::Sender<ThumbnailRequest>,
+    playlist_request_tx: std_mpsc::Sender<PlaylistRequest>,
+    playlist_rx: Receiver<PlaylistExpansionEvent>,
+    pending_playlists: HashSet<String>,
     thumbnail_cache: HashMap<String, ThumbnailCacheEntry>,
     thumbnail_lru: VecDeque<String>,
+    thumbnail_texture_ready: VecDeque<u64>,
     thumbnail_cache_dir: Option<PathBuf>,
     diagnostics: RuntimeDiagnostics,
     diagnostics_rx: Receiver<RuntimeDiagnostics>,
@@ -269,10 +301,16 @@ struct GuiApp {
 impl GuiApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let config_path = Config::path().ok();
-        let config = config_path
-            .as_deref()
-            .and_then(|path| Config::load(path).ok())
-            .unwrap_or_default();
+        let (config, config_load_error) = match config_path.as_deref() {
+            Some(path) => match Config::load(path) {
+                Ok(config) => (config, None),
+                Err(error) => (Config::default(), Some(error.to_string())),
+            },
+            None => (
+                Config::default(),
+                Some("Could not determine the configuration path".into()),
+            ),
+        };
         configure_style(&cc.egui_ctx, &config);
         let mode = match config.default_mode.as_str() {
             "audio" => DownloadMode::Audio,
@@ -286,15 +324,24 @@ impl GuiApp {
             .map(available_impersonation_targets)
             .unwrap_or_default();
         let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (download_request_tx, mut download_request_rx) =
+            mpsc::unbounded_channel::<DownloadRequest>();
         let (thumbnail_tx, thumbnail_rx) = std_mpsc::channel();
         let (thumbnail_request_tx, thumbnail_request_rx) = std_mpsc::channel::<ThumbnailRequest>();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
+        let (playlist_request_tx, playlist_request_rx) = std_mpsc::channel::<PlaylistRequest>();
+        let (playlist_tx, playlist_rx) = std_mpsc::channel();
         let thumbnail_request_rx = Arc::new(Mutex::new(thumbnail_request_rx));
         let thumbnail_cache_dir = thumbnail_cache_directory();
+        let thumbnail_client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()
+            .map_err(|error| format!("thumbnail client error: {error}"));
         for _ in 0..4 {
             let request_rx = Arc::clone(&thumbnail_request_rx);
             let result_tx = thumbnail_tx.clone();
             let cache_dir = thumbnail_cache_dir.clone();
+            let client = thumbnail_client.clone();
             std::thread::spawn(move || loop {
                 let request = match request_rx.lock() {
                     Ok(receiver) => receiver.recv(),
@@ -303,14 +350,59 @@ impl GuiApp {
                 let Ok(request) = request else {
                     break;
                 };
-                let result = download_thumbnail(&request.url, cache_dir.as_deref());
+                let result = client.as_ref().map_err(Clone::clone).and_then(|client| {
+                    download_thumbnail(client, &request.url, cache_dir.as_deref())
+                });
                 let _ = result_tx.send(QueueThumbnailEvent {
-                    index: request.index,
+                    id: request.id,
                     result,
                 });
             });
         }
-        let status = if yt_dlp.is_some() {
+        std::thread::spawn(move || {
+            while let Ok(request) = playlist_request_rx.recv() {
+                let result = expand_playlist_urls(&request.executable, &request.url);
+                let title = playlist_title(&request.executable, &request.url);
+                let _ = playlist_tx.send(PlaylistExpansionEvent {
+                    url: request.url,
+                    playlist_title: title,
+                    result,
+                });
+            }
+        });
+        let worker_event_tx = event_tx;
+        std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                while let Some(request) = download_request_rx.recv().await {
+                    let event_tx = worker_event_tx.clone();
+                    tokio::spawn(async move {
+                        let (download_tx, mut download_rx) = mpsc::unbounded_channel();
+                        let forward = tokio::spawn(async move {
+                            while let Some(event) = download_rx.recv().await {
+                                let _ = event_tx.send(JobEvent {
+                                    id: request.id,
+                                    event,
+                                });
+                            }
+                        });
+                        request
+                            .downloader
+                            .run(request.args, request.cancel_rx, download_tx)
+                            .await;
+                        let _ = forward.await;
+                    });
+                }
+            });
+        });
+        let status = if let Some(error) = &config_load_error {
+            format!("Configuration not loaded: {error}")
+        } else if yt_dlp.is_some() {
             "Ready".to_owned()
         } else {
             "yt-dlp was not found in PATH or beside the application".to_owned()
@@ -325,21 +417,30 @@ impl GuiApp {
             search_query: String::new(),
             config,
             config_path,
+            config_load_error,
             input: String::new(),
             mode,
             queue: Vec::new(),
+            next_queue_id: 1,
+            queue_row_offsets: vec![0.0],
+            queue_layout_width: 0.0,
+            queue_layout_dirty: true,
             queue_running: false,
             active_downloads: HashMap::new(),
-            event_tx,
             event_rx,
+            download_request_tx,
             impersonation_targets,
             logs: VecDeque::new(),
             status,
             folder_picker_rx: None,
             thumbnail_rx,
             thumbnail_request_tx,
+            playlist_request_tx,
+            playlist_rx,
+            pending_playlists: HashSet::new(),
             thumbnail_cache: HashMap::new(),
             thumbnail_lru: VecDeque::new(),
+            thumbnail_texture_ready: VecDeque::new(),
             thumbnail_cache_dir,
             diagnostics: RuntimeDiagnostics::placeholder(),
             diagnostics_rx,
@@ -350,6 +451,12 @@ impl GuiApp {
     }
 
     fn save_config(&mut self) {
+        if let Some(error) = &self.config_load_error {
+            self.status = format!(
+                "Configuration was not saved because the existing file could not be loaded: {error}"
+            );
+            return;
+        }
         if let Some(path) = &self.config_path {
             if let Err(error) = self.config.save(path) {
                 self.status = error.to_string();
@@ -398,6 +505,7 @@ impl GuiApp {
             return;
         }
         let mut added = 0;
+        let pending_before = self.pending_playlists.len();
         for url in values {
             match self.expand_or_enqueue(&url) {
                 Ok(count) => added += count,
@@ -407,23 +515,31 @@ impl GuiApp {
         if added > 0 {
             self.input.clear();
             self.status = format!("Added {added} item(s) to the queue");
+        } else if self.pending_playlists.len() > pending_before {
+            self.input.clear();
+            self.status = "Inspecting playlist in the background…".into();
         } else {
             self.status = "No valid URLs were added".into();
         }
     }
 
-    fn paste_input_from_clipboard(&mut self) {
+    fn paste_input_from_clipboard(&mut self) -> bool {
         match read_clipboard_text() {
             Ok(text) => {
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
                     self.status = "Clipboard is empty".into();
+                    false
                 } else {
                     self.input = trimmed.to_owned();
                     self.status = "Pasted URL(s) from clipboard".into();
+                    true
                 }
             }
-            Err(error) => self.status = error,
+            Err(error) => {
+                self.status = error;
+                false
+            }
         }
     }
 
@@ -440,44 +556,38 @@ impl GuiApp {
             let yt_dlp = dependency_path("yt-dlp").ok_or_else(|| {
                 "yt-dlp was not found in PATH or beside the application".to_owned()
             })?;
-            match expand_playlist_urls(&yt_dlp, url) {
-                Ok(Some(entries)) => {
-                    self.log(format!(
-                        "Expanded playlist into {} item(s): {url}",
-                        entries.len()
-                    ));
-                    for entry in &entries {
-                        self.enqueue_playlist_entry(entry);
-                    }
-                    self.status = format!("Expanded playlist into {} item(s)", entries.len());
-                    return Ok(entries.len());
-                }
-                Ok(None) => {
-                    return Err(format!(
-                        "playlist expansion returned no entries for supported URL: {url}"
-                    ));
-                }
-                Err(error) => {
-                    self.log(format!("Playlist expansion failed: {error}"));
-                    return Err(error);
-                }
+            if self.pending_playlists.contains(url) {
+                return Err(format!("playlist inspection is already running: {url}"));
             }
+            self.playlist_request_tx
+                .send(PlaylistRequest {
+                    executable: yt_dlp,
+                    url: url.to_owned(),
+                })
+                .map_err(|_| "playlist worker is unavailable".to_owned())?;
+            self.pending_playlists.insert(url.to_owned());
+            self.log(format!("Inspecting playlist: {url}"));
+            return Ok(0);
         }
-        self.enqueue_url(url);
-        Ok(1)
+        Ok(usize::from(self.enqueue_url(url)))
     }
 
-    fn enqueue_url(&mut self, url: &str) {
-        self.enqueue_queue_item(None, url, None, true);
+    fn enqueue_url(&mut self, url: &str) -> bool {
+        self.enqueue_queue_item(None, url, None, None, true)
     }
 
-    fn enqueue_playlist_entry(&mut self, entry: &PlaylistEntry) {
+    fn enqueue_playlist_entry(
+        &mut self,
+        entry: &PlaylistEntry,
+        playlist_folder: Option<&str>,
+    ) -> bool {
         self.enqueue_queue_item(
             entry.title.clone(),
             &entry.url,
             entry.thumbnail_url.clone(),
+            playlist_folder,
             false,
-        );
+        )
     }
 
     fn enqueue_queue_item(
@@ -485,16 +595,25 @@ impl GuiApp {
         title: Option<String>,
         url: &str,
         thumbnail_url: Option<String>,
+        playlist_folder: Option<&str>,
         log_add: bool,
-    ) {
+    ) -> bool {
+        if self.queue.iter().any(|item| item.url.as_ref() == url) {
+            return false;
+        }
         if log_add {
             self.log(format!("Added to queue: {url}"));
         }
-        let index = self.queue.len();
+        let id = self.next_queue_id;
+        self.next_queue_id = self.next_queue_id.wrapping_add(1).max(1);
         self.queue.push(GuiQueueItem {
+            id,
             title: title.map(String::into_boxed_str),
             url: url.to_owned().into_boxed_str(),
             thumbnail_url: thumbnail_url.map(String::into_boxed_str),
+            playlist_folder: playlist_folder
+                .map(str::to_owned)
+                .map(String::into_boxed_str),
             thumbnail_requested: false,
             thumbnail_failed: false,
             thumbnail_image: None,
@@ -504,13 +623,15 @@ impl GuiApp {
             progress_text: String::new(),
             error: None,
         });
-        let _ = index;
+        self.queue_layout_dirty = true;
+        true
     }
 
     fn request_thumbnail(&mut self, index: usize) {
         let Some(item) = self.queue.get(index) else {
             return;
         };
+        let id = item.id;
         if item.thumbnail_requested
             || item.thumbnail_failed
             || item.thumbnail_texture.is_some()
@@ -529,6 +650,7 @@ impl GuiApp {
                     item.thumbnail_texture = Some(texture);
                 } else if let Some(image) = entry.image {
                     item.thumbnail_image = Some(image);
+                    self.thumbnail_texture_ready.push_back(id);
                 }
             }
             return;
@@ -537,7 +659,7 @@ impl GuiApp {
             item.thumbnail_requested = true;
         }
         let _ = self.thumbnail_request_tx.send(ThumbnailRequest {
-            index,
+            id,
             url: thumbnail_key,
         });
     }
@@ -715,8 +837,17 @@ impl GuiApp {
             );
             return false;
         };
-        if self.mode.needs_ffmpeg() && dependency_path("ffmpeg").is_none() {
-            self.fail(index, "ffmpeg is required for this download mode");
+        if (self.mode.needs_ffmpeg() || self.config.embed_metadata)
+            && dependency_path("ffmpeg").is_none()
+        {
+            self.fail(
+                index,
+                if self.config.embed_metadata && !self.mode.needs_ffmpeg() {
+                    "ffmpeg is required to embed metadata"
+                } else {
+                    "ffmpeg is required for this download mode"
+                },
+            );
             return false;
         }
         if !self.apply_output_dir()
@@ -729,53 +860,50 @@ impl GuiApp {
         }
 
         let url = self.queue[index].url.clone();
+        let id = self.queue[index].id;
         let mode = self.mode.clone();
-        let options = match OwnedDownloadOptions::from_config(&self.config, &url) {
-            Ok(options) => options,
+        let playlist_folder = self.queue[index].playlist_folder.clone();
+        let options =
+            match OwnedDownloadOptions::from_config(&self.config, &url, playlist_folder.as_deref())
+            {
+                Ok(options) => options,
+                Err(message) => {
+                    self.fail(index, &message);
+                    return false;
+                }
+            };
+        let downloader = Downloader::new(yt_dlp, self.config.output_dir.clone());
+        let args = match downloader.arguments(&url, &mode, options.borrow()) {
+            Ok(args) => args,
             Err(message) => {
                 self.fail(index, &message);
                 return false;
             }
         };
-        let downloader = Downloader::new(yt_dlp, self.config.output_dir.clone());
-        let args = downloader.arguments(&url, &mode, options.borrow());
         let (cancel_tx, cancel_rx) = oneshot::channel();
-        let (download_tx, mut download_rx) = mpsc::unbounded_channel();
-        let event_tx = self.event_tx.clone();
-
-        self.active_downloads.insert(index, cancel_tx);
+        self.active_downloads.insert(id, cancel_tx);
         self.queue[index].state = DownloadState::Downloading;
         self.queue[index].progress = 0.0;
         self.queue[index].progress_text.clear();
         self.queue[index].error = None;
+        self.queue_layout_dirty = true;
         self.status = format!("Running {} active download(s)", self.active_downloads.len());
         self.log(format!("Starting download: {url}"));
 
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build();
-            match runtime {
-                Ok(runtime) => runtime.block_on(async move {
-                    let forward_tx = event_tx.clone();
-                    let forward = tokio::spawn(async move {
-                        while let Some(event) = download_rx.recv().await {
-                            let _ = forward_tx.send(JobEvent { index, event });
-                        }
-                    });
-                    downloader.run(args, cancel_rx, download_tx).await;
-                    let _ = forward.await;
-                }),
-                Err(error) => {
-                    let _ = event_tx.send(JobEvent {
-                        index,
-                        event: DownloadEvent::Failed(format!(
-                            "could not start async runtime: {error}"
-                        )),
-                    });
-                }
-            }
-        });
+        if self
+            .download_request_tx
+            .send(DownloadRequest {
+                id,
+                downloader,
+                args,
+                cancel_rx,
+            })
+            .is_err()
+        {
+            self.active_downloads.remove(&id);
+            self.fail(index, "download worker is unavailable");
+            return false;
+        }
         true
     }
 
@@ -783,6 +911,7 @@ impl GuiApp {
         let message = friendly_error(&self.queue[index].url, message);
         self.queue[index].state = DownloadState::Failed;
         self.queue[index].error = Some(message.clone());
+        self.queue_layout_dirty = true;
         self.status = message.clone();
         self.log(format!("ERROR: {message}"));
     }
@@ -815,6 +944,7 @@ impl GuiApp {
             self.status = "No failed or cancelled items to restart".into();
             return;
         }
+        self.queue_layout_dirty = true;
 
         self.status = format!("Restarted {restarted} item(s)");
         self.log(format!("Restarted {restarted} failed/cancelled item(s)"));
@@ -835,52 +965,59 @@ impl GuiApp {
 
     fn process_events(&mut self) {
         while let Ok(job) = self.event_rx.try_recv() {
-            if job.index >= self.queue.len() {
+            let Some(index) = self.queue.iter().position(|item| item.id == job.id) else {
                 continue;
-            }
+            };
             match job.event {
                 DownloadEvent::Progress { percent, text } => {
-                    self.queue[job.index].progress = percent.unwrap_or_default() as f32 / 100.0;
-                    self.queue[job.index].progress_text = text;
+                    self.queue[index].progress = percent.unwrap_or_default() as f32 / 100.0;
+                    self.queue[index].progress_text = text;
                 }
                 DownloadEvent::Finished => {
-                    self.queue[job.index].state = DownloadState::Finished;
-                    self.queue[job.index].progress = 1.0;
-                    self.queue[job.index].progress_text = "done".into();
-                    self.queue[job.index].error = None;
-                    self.active_downloads.remove(&job.index);
-                    self.log(format!("Finished: {}", self.queue[job.index].url));
+                    self.queue_layout_dirty = true;
+                    self.queue[index].state = DownloadState::Finished;
+                    self.queue[index].progress = 1.0;
+                    self.queue[index].progress_text = "done".into();
+                    self.queue[index].error = None;
+                    self.active_downloads.remove(&job.id);
+                    self.log(format!("Finished: {}", self.queue[index].url));
                     self.status = "Download finished".into();
                 }
                 DownloadEvent::Failed(message) => {
-                    let message = friendly_error(&self.queue[job.index].url, &message);
-                    self.queue[job.index].state = DownloadState::Failed;
-                    self.queue[job.index].error = Some(message.clone());
-                    self.active_downloads.remove(&job.index);
+                    self.queue_layout_dirty = true;
+                    let message = friendly_error(&self.queue[index].url, &message);
+                    self.queue[index].state = DownloadState::Failed;
+                    self.queue[index].error = Some(message.clone());
+                    self.active_downloads.remove(&job.id);
                     self.log(format!("ERROR: {message}"));
                     self.status = message;
                 }
                 DownloadEvent::Cancelled => {
-                    self.queue[job.index].state = DownloadState::Cancelled;
-                    self.queue[job.index].progress_text = "cancelled".into();
-                    self.active_downloads.remove(&job.index);
-                    self.log(format!("Cancelled: {}", self.queue[job.index].url));
+                    self.queue_layout_dirty = true;
+                    self.queue[index].state = DownloadState::Cancelled;
+                    self.queue[index].progress_text = "cancelled".into();
+                    self.active_downloads.remove(&job.id);
+                    self.log(format!("Cancelled: {}", self.queue[index].url));
                     self.status = "Download cancelled".into();
                 }
             }
         }
 
         while let Ok(event) = self.thumbnail_rx.try_recv() {
-            let thumbnail_url = self
-                .queue
-                .get(event.index)
-                .and_then(|item| item.thumbnail_url.as_deref().map(str::to_owned));
-            if let Some(item) = self.queue.get_mut(event.index) {
+            let Some(index) = self.queue.iter().position(|item| item.id == event.id) else {
+                continue;
+            };
+            let thumbnail_url = self.queue[index]
+                .thumbnail_url
+                .as_deref()
+                .map(str::to_owned);
+            if let Some(item) = self.queue.get_mut(index) {
                 match event.result {
                     Ok(image) => {
                         item.thumbnail_requested = false;
                         item.thumbnail_failed = false;
                         item.thumbnail_image = Some(image.clone());
+                        self.thumbnail_texture_ready.push_back(event.id);
                         if let Some(url) = thumbnail_url.as_deref() {
                             self.cache_thumbnail_image(url, image);
                         }
@@ -889,6 +1026,36 @@ impl GuiApp {
                         item.thumbnail_requested = false;
                         item.thumbnail_failed = true;
                     }
+                }
+            }
+        }
+
+        while let Ok(event) = self.playlist_rx.try_recv() {
+            self.pending_playlists.remove(&event.url);
+            match event.result {
+                Ok(Some(entries)) if !entries.is_empty() => {
+                    let mut count = 0;
+                    let folder = playlist_folder_name(&event.url, event.playlist_title.as_deref());
+                    for entry in &entries {
+                        count += usize::from(self.enqueue_playlist_entry(entry, folder.as_deref()));
+                    }
+                    self.log(format!(
+                        "Expanded playlist into {count} new item(s): {}",
+                        event.url
+                    ));
+                    self.status = format!("Added {count} new playlist item(s) to the queue");
+                }
+                Ok(_) => {
+                    let message = format!(
+                        "playlist expansion returned no entries for supported URL: {}",
+                        event.url
+                    );
+                    self.log(format!("Playlist expansion failed: {message}"));
+                    self.status = message;
+                }
+                Err(error) => {
+                    self.log(format!("Playlist expansion failed: {error}"));
+                    self.status = error;
                 }
             }
         }
@@ -914,17 +1081,12 @@ impl GuiApp {
     }
 
     fn ensure_thumbnail_textures(&mut self, ctx: &egui::Context) {
-        for index in 0..self.queue.len() {
+        while let Some(id) = self.thumbnail_texture_ready.pop_front() {
+            let Some(index) = self.queue.iter().position(|item| item.id == id) else {
+                continue;
+            };
             if self.queue[index].thumbnail_texture.is_some() {
                 continue;
-            }
-            if let Some(url) = self.queue[index].thumbnail_url.as_deref() {
-                if let Some(entry) = self.thumbnail_cache.get(url) {
-                    if let Some(texture) = entry.texture.clone() {
-                        self.queue[index].thumbnail_texture = Some(texture);
-                        continue;
-                    }
-                }
             }
             let thumbnail_url = self.queue[index]
                 .thumbnail_url
@@ -943,6 +1105,25 @@ impl GuiApp {
             }
             self.queue[index].thumbnail_texture = Some(texture);
         }
+    }
+
+    fn ensure_queue_layout(&mut self, width: f32) {
+        if !self.queue_layout_dirty
+            && (self.queue_layout_width - width).abs() < 1.0
+            && self.queue_row_offsets.len() == self.queue.len() + 1
+        {
+            return;
+        }
+        self.queue_row_offsets.clear();
+        self.queue_row_offsets.reserve(self.queue.len() + 1);
+        self.queue_row_offsets.push(0.0);
+        let mut offset = 0.0;
+        for item in &self.queue {
+            offset += queue_row_height(item, width);
+            self.queue_row_offsets.push(offset);
+        }
+        self.queue_layout_width = width;
+        self.queue_layout_dirty = false;
     }
 
     fn poll_folder_picker(&mut self) {
@@ -988,8 +1169,14 @@ impl GuiApp {
                 })
                 .inner;
             if paste_clicked {
-                self.paste_input_from_clipboard();
                 response.request_focus();
+                if !self.paste_input_from_clipboard() {
+                    // eframe owns the native clipboard integration and turns
+                    // this request into an egui Paste event for the focused field.
+                    ui.ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                    self.status = "Paste requested from the desktop clipboard…".into();
+                }
                 ui.ctx().request_repaint();
             }
             if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
@@ -1323,6 +1510,31 @@ impl GuiApp {
         ui.small(
             "Enabled by default. Supported playlist URLs are expanded into queue entries before downloading.",
         );
+        if ui
+            .checkbox(
+                &mut self.config.playlist_subfolders,
+                "Create a folder for each playlist",
+            )
+            .changed()
+        {
+            self.save_config();
+        }
+        if ui
+            .checkbox(&mut self.config.embed_metadata, "Embed metadata and tags")
+            .changed()
+        {
+            self.save_config();
+        }
+        if ui
+            .checkbox(
+                &mut self.config.write_info_json,
+                "Write .info.json metadata",
+            )
+            .changed()
+        {
+            self.save_config();
+        }
+        ui.small("Tags are copied only when the extractor reports them from the source page.");
 
         ui.horizontal(|ui| {
             ui.label("Speed limit");
@@ -1513,45 +1725,31 @@ impl GuiApp {
                     ui.label("Add one or more URLs to begin.");
                 });
             } else {
+                let mut visible_ids = HashSet::new();
+                self.ensure_queue_layout(full_width);
                 egui::ScrollArea::vertical()
                     .max_height(max_height.max(120.0))
                     .auto_shrink([false, false])
                     .show_viewport(ui, |ui, viewport| {
-                        let mut heights = Vec::with_capacity(self.queue.len());
-                        let mut total_height = 0.0f32;
-                        for item in &self.queue {
-                            let height = queue_row_height(item, full_width);
-                            heights.push(height);
-                            total_height += height;
-                        }
-
                         let start_y = viewport.min.y.max(0.0);
                         let end_y = viewport.max.y;
-                        let mut top_space = 0.0f32;
-                        let mut cursor = 0.0f32;
-                        let mut visible = Vec::new();
-
-                        for (index, height) in heights.iter().copied().enumerate() {
-                            let row_end = cursor + height;
-                            if row_end < start_y {
-                                top_space += height;
-                            } else if cursor <= end_y {
-                                visible.push((index, height));
-                            }
-                            cursor = row_end;
-                            if cursor > end_y && !visible.is_empty() {
-                                break;
-                            }
-                        }
-
-                        let visible_height: f32 = visible.iter().map(|(_, height)| *height).sum();
-                        let bottom_space = (total_height - top_space - visible_height).max(0.0);
+                        let start_index = self.queue_row_offsets[1..]
+                            .partition_point(|row_end| *row_end < start_y);
+                        let end_index = self.queue_row_offsets[..self.queue.len()]
+                            .partition_point(|row_start| *row_start <= end_y)
+                            .max(start_index)
+                            .min(self.queue.len());
+                        let top_space = self.queue_row_offsets[start_index];
+                        let bottom_space = (self.queue_row_offsets[self.queue.len()]
+                            - self.queue_row_offsets[end_index])
+                            .max(0.0);
 
                         if top_space > 0.0 {
                             ui.add_space(top_space);
                         }
 
-                        for (index, _) in visible {
+                        for index in start_index..end_index {
+                            visible_ids.insert(self.queue[index].id);
                             self.request_thumbnail(index);
                             let item = &self.queue[index];
                             queue_row(ui, index, item);
@@ -1562,6 +1760,15 @@ impl GuiApp {
                             ui.add_space(bottom_space);
                         }
                     });
+                // Queue rows do not own off-screen GPU textures. The bounded LRU
+                // remains the sole long-lived owner, so scrolling a huge queue
+                // cannot retain one texture per item indefinitely.
+                for item in &mut self.queue {
+                    if !visible_ids.contains(&item.id) {
+                        item.thumbnail_texture = None;
+                        item.thumbnail_image = None;
+                    }
+                }
             }
             ui.add_space(10.0);
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1580,6 +1787,7 @@ impl GuiApp {
                                 | DownloadState::Cancelled
                         )
                     });
+                    self.queue_layout_dirty = true;
                 }
             });
         });
@@ -1594,8 +1802,8 @@ impl GuiApp {
                 self.config.max_active_downloads.clamp(1, 8)
             ),
             |ui| {
-                if let Some(index) = active_indices(&self.active_downloads).into_iter().next() {
-                    if let Some(item) = self.queue.get(index) {
+                if let Some(id) = active_ids(&self.active_downloads).into_iter().next() {
+                    if let Some(item) = self.queue.iter().find(|item| item.id == id) {
                         ui.horizontal(|ui| {
                             thumbnail_placeholder(ui, item);
                             ui.vertical(|ui| {
@@ -1750,10 +1958,12 @@ impl eframe::App for GuiApp {
                     });
             });
         egui::CentralPanel::default().show(ctx, |ui| {
-            let queue_max_height = (ui.available_height() * 0.42).clamp(180.0, 360.0);
-            self.queue_panel(ui, queue_max_height);
-            ui.add_space(10.0);
+            // Controls come first so Start/Resume stays visible even when the
+            // queue or log contains enough content to consume the panel.
             self.queue_controls_panel(ui);
+            ui.add_space(10.0);
+            let queue_max_height = (ui.available_height() * 0.48).clamp(150.0, 340.0);
+            self.queue_panel(ui, queue_max_height);
             ui.add_space(10.0);
             self.queue_log_panel(ui);
         });
@@ -1827,6 +2037,8 @@ impl eframe::App for GuiApp {
             || self.folder_picker_rx.is_some()
             || self.queue_running
             || self.diagnostics_refresh_pending
+            || !self.pending_playlists.is_empty()
+            || self.queue.iter().any(|item| item.thumbnail_requested)
         {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -1843,11 +2055,19 @@ struct OwnedDownloadOptions {
     socket_timeout: Option<u32>,
     retries: Option<u32>,
     fragment_retries: Option<u32>,
+    playlist_subfolder: Option<String>,
+    playlist_subfolders: bool,
+    embed_metadata: bool,
+    write_info_json: bool,
     allow_playlists: bool,
 }
 
 impl OwnedDownloadOptions {
-    fn from_config(config: &Config, url: &str) -> Result<Self, String> {
+    fn from_config(
+        config: &Config,
+        url: &str,
+        playlist_subfolder: Option<&str>,
+    ) -> Result<Self, String> {
         validate_output_template(&config.output_template)?;
         validate_rate_limit(&config.rate_limit)?;
         let tuning = resolve_network_tuning(
@@ -1880,6 +2100,12 @@ impl OwnedDownloadOptions {
             socket_timeout: tuning.socket_timeout,
             retries: tuning.retries,
             fragment_retries: tuning.fragment_retries,
+            playlist_subfolder: playlist_subfolder.map(str::to_owned),
+            // GUI playlist expansion supplies an explicit sanitized folder per
+            // queue item; do not add %(playlist_title)s to direct-video jobs.
+            playlist_subfolders: false,
+            embed_metadata: config.embed_metadata,
+            write_info_json: config.write_info_json,
             allow_playlists: config.allow_playlists,
         })
     }
@@ -1895,6 +2121,10 @@ impl OwnedDownloadOptions {
             socket_timeout: self.socket_timeout,
             retries: self.retries,
             fragment_retries: self.fragment_retries,
+            playlist_subfolder: self.playlist_subfolder.as_deref(),
+            playlist_subfolders: self.playlist_subfolders,
+            embed_metadata: self.embed_metadata,
+            write_info_json: self.write_info_json,
             allow_playlists: self.allow_playlists,
         }
     }
@@ -2114,8 +2344,15 @@ fn text_edit_with_context_menu(
             ui.close_menu();
         }
         if ui.button("Paste").clicked() {
-            if let Ok(text) = read_clipboard_text() {
-                *value = text;
+            let pasted = read_clipboard_text()
+                .ok()
+                .filter(|text| !text.is_empty())
+                .map(|text| *value = text)
+                .is_some();
+            if !pasted {
+                response.request_focus();
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::RequestPaste);
             }
             ui.close_menu();
         }
@@ -2128,12 +2365,14 @@ fn text_edit_with_context_menu(
 }
 
 fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
+    let expected_outer_height = queue_row_height(item, ui.available_width()) - 6.0;
     egui::Frame::group(ui.style())
         .fill(PANEL_ALT)
         .inner_margin(egui::Margin::same(12))
         .stroke(egui::Stroke::new(1.0, Color32::from_gray(54)))
         .corner_radius(10.0)
         .show(ui, |ui| {
+            ui.set_min_height((expected_outer_height - 24.0).max(0.0));
             let full_width = ui.available_width();
             let number_width = 22.0;
             let thumb_width = if full_width < 760.0 { 72.0 } else { 84.0 };
@@ -2325,10 +2564,10 @@ fn status_badge(ui: &mut egui::Ui, state: DownloadState) {
         });
 }
 
-fn active_indices(active_downloads: &HashMap<usize, oneshot::Sender<()>>) -> Vec<usize> {
-    let mut indices: Vec<_> = active_downloads.keys().copied().collect();
-    indices.sort_unstable();
-    indices
+fn active_ids(active_downloads: &HashMap<u64, oneshot::Sender<()>>) -> Vec<u64> {
+    let mut ids: Vec<_> = active_downloads.keys().copied().collect();
+    ids.sort_unstable();
+    ids
 }
 
 fn state_color(state: DownloadState) -> Color32 {
@@ -2384,15 +2623,15 @@ fn queue_item_title(item: &GuiQueueItem) -> Cow<'_, str> {
 
 fn queue_row_height(item: &GuiQueueItem, full_width: f32) -> f32 {
     let narrow = full_width < 700.0;
-    let mut height = if narrow { 88.0 } else { 72.0 };
+    let mut height = if narrow { 92.0 } else { 94.0 };
     if item.error.is_some() {
-        height += if narrow { 24.0 } else { 18.0 };
+        height += if narrow { 30.0 } else { 20.0 };
     }
     if matches!(
         item.state,
         DownloadState::Downloading | DownloadState::Finished
     ) {
-        height += if narrow { 30.0 } else { 18.0 };
+        height += if narrow { 48.0 } else { 0.0 };
     }
     height + 6.0
 }
@@ -2434,30 +2673,60 @@ fn pretty_title_from_url(url: &str) -> Cow<'_, str> {
     }
 }
 
+fn playlist_folder_name(url: &str, title: Option<&str>) -> Option<String> {
+    title
+        .and_then(|value| sanitize_filename_component(value).ok())
+        .or_else(|| {
+            url.split_once("/playlists/")
+                .and_then(|(_, value)| value.split(['?', '#', '/']).next())
+                .and_then(|value| sanitize_filename_component(value).ok())
+        })
+}
+
 fn download_thumbnail(
+    client: &reqwest::blocking::Client,
     url: &str,
     cache_dir: Option<&std::path::Path>,
 ) -> Result<DecodedThumbnail, String> {
     if let Some(cache_path) = cache_dir.and_then(|dir| thumbnail_cache_path(dir, url)) {
         if cache_path.is_file() {
-            return decode_thumbnail_from_path(&cache_path);
+            match decode_thumbnail_from_path(&cache_path) {
+                Ok(image) => return Ok(image),
+                Err(_) => {
+                    let _ = std::fs::remove_file(cache_path);
+                }
+            }
         }
     }
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("thumbnail client error: {error}"))?;
-    let bytes = client
+    let response = client
         .get(url)
         .send()
         .and_then(|response| response.error_for_status())
-        .map_err(|error| format!("thumbnail request failed: {error}"))?
-        .bytes()
+        .map_err(|error| format!("thumbnail request failed: {error}"))?;
+    if response
+        .content_length()
+        .is_some_and(|length| length > THUMBNAIL_RESPONSE_LIMIT)
+    {
+        return Err("thumbnail response exceeds the 5 MiB limit".into());
+    }
+    let mut bytes = Vec::new();
+    response
+        .take(THUMBNAIL_RESPONSE_LIMIT + 1)
+        .read_to_end(&mut bytes)
         .map_err(|error| format!("thumbnail read failed: {error}"))?;
-    let image = ImageReader::new(std::io::Cursor::new(bytes))
+    if bytes.len() as u64 > THUMBNAIL_RESPONSE_LIMIT {
+        return Err("thumbnail response exceeds the 5 MiB limit".into());
+    }
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
         .with_guessed_format()
-        .map_err(|error| format!("thumbnail format error: {error}"))?
+        .map_err(|error| format!("thumbnail format error: {error}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
         .decode()
         .map_err(|error| format!("thumbnail decode failed: {error}"))?
         .thumbnail(160, 90)
@@ -2481,8 +2750,32 @@ fn thumbnail_cache_directory() -> Option<PathBuf> {
     directories::ProjectDirs::from("org", "crusty-dlp", "crusty-dlp").map(|dirs| {
         let dir = dirs.cache_dir().join("thumbnails");
         let _ = std::fs::create_dir_all(&dir);
+        let _ = prune_thumbnail_disk_cache(&dir, THUMBNAIL_DISK_CACHE_LIMIT);
         dir
     })
+}
+
+fn prune_thumbnail_disk_cache(directory: &std::path::Path, limit: u64) -> std::io::Result<()> {
+    let mut files = std::fs::read_dir(directory)?
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let metadata = entry.metadata().ok()?;
+            metadata
+                .is_file()
+                .then(|| (entry.path(), metadata.modified().ok(), metadata.len()))
+        })
+        .collect::<Vec<_>>();
+    let mut total: u64 = files.iter().map(|(_, _, size)| size).sum();
+    files.sort_by_key(|(_, modified, _)| *modified);
+    for (path, _, size) in files {
+        if total <= limit {
+            break;
+        }
+        if std::fs::remove_file(path).is_ok() {
+            total = total.saturating_sub(size);
+        }
+    }
+    Ok(())
 }
 
 fn thumbnail_cache_path(directory: &std::path::Path, url: &str) -> Option<PathBuf> {

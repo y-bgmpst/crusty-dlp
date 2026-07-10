@@ -4,7 +4,10 @@ use tokio::sync::oneshot;
 
 use crate::{
     config::Config,
-    downloader::{resolve_network_tuning, DownloadEvent, DownloadOptions},
+    downloader::{
+        resolve_network_tuning, supports_playlist_expansion, validate_output_template,
+        validate_rate_limit, DownloadEvent, DownloadOptions,
+    },
     errors::AppError,
     search::{open_platform_search, SearchPlatform},
 };
@@ -324,6 +327,8 @@ impl App {
     }
 
     pub fn download_options<'a>(&'a self, url: &str) -> Result<DownloadOptions<'a>, String> {
+        validate_output_template(&self.config.output_template)?;
+        validate_rate_limit(&self.config.rate_limit)?;
         let tuning = resolve_network_tuning(
             url,
             &self.config.socket_timeout,
@@ -336,7 +341,7 @@ impl App {
                 "none" => None,
                 browser => Some(browser),
             },
-            concurrent_fragments: self.config.concurrent_fragments,
+            concurrent_fragments: self.config.concurrent_fragments.clamp(1, 16),
             use_aria2: self.config.use_aria2 && self.aria2_available,
             output_template: Some(self.config.output_template.as_str()),
             rate_limit: (!self.config.rate_limit.trim().is_empty())
@@ -344,6 +349,11 @@ impl App {
             socket_timeout: tuning.socket_timeout,
             retries: tuning.retries,
             fragment_retries: tuning.fragment_retries,
+            playlist_subfolder: None,
+            playlist_subfolders: self.config.playlist_subfolders
+                && supports_playlist_expansion(url),
+            embed_metadata: self.config.embed_metadata,
+            write_info_json: self.config.write_info_json,
             allow_playlists: self.config.allow_playlists,
         })
     }

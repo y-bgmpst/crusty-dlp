@@ -29,13 +29,41 @@ class PMVHavenIE(InfoExtractor):
         else:
             formats = [{"url": media_url, "http_headers": {"Referer": url}}]
 
+        tags = _page_tags(self, webpage, info)
+
         return {
             **info,
             "id": display_id.rsplit("_", 1)[-1],
             "display_id": display_id,
             "formats": formats,
+            "tags": tags,
             "age_limit": 18,
         }
+
+
+def _page_tags(extractor, webpage, info):
+    """Use only tags published by PMVHaven's page metadata or tag links."""
+    values = info.get("keywords") if isinstance(info, dict) else None
+    if isinstance(values, str):
+        values = re.split(r"[,;]", values)
+    tags = [str(value).strip() for value in (values or []) if str(value).strip()]
+    keywords = extractor._html_search_meta("keywords", webpage, fatal=False)
+    if keywords:
+        tags.extend(part.strip() for part in re.split(r"[,;]", keywords) if part.strip())
+    tags.extend(
+        match.group("tag").strip()
+        for match in re.finditer(
+            r"href=[\"'][^\"']*/tags/[^\"']*[\"'][^>]*>(?P<tag>[^<]+)<",
+            webpage,
+            flags=re.IGNORECASE,
+        )
+        if match.group("tag").strip()
+    )
+    deduped = []
+    for tag in tags:
+        if tag.casefold() not in {value.casefold() for value in deduped}:
+            deduped.append(tag)
+    return deduped
 
 
 class PMVHavenPlaylistIE(InfoExtractor):

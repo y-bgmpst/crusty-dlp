@@ -756,6 +756,7 @@ dependencies = [
  "directories",
  "eframe",
  "image",
+ "libc",
  "ratatui",
  "reqwest",
  "rfd",

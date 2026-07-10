@@ -44,6 +44,8 @@ package() {
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
   install -Dm644 plugins/yt_dlp_plugins/extractor/boyfriendtv.py \
     "$pkgdir/usr/share/$pkgname/plugins/yt_dlp_plugins/extractor/boyfriendtv.py"
+  install -Dm644 plugins/yt_dlp_plugins/extractor/ooxxx.py \
+    "$pkgdir/usr/share/$pkgname/plugins/yt_dlp_plugins/extractor/ooxxx.py"
   install -Dm644 plugins/yt_dlp_plugins/extractor/pmvhaven.py \
     "$pkgdir/usr/share/$pkgname/plugins/yt_dlp_plugins/extractor/pmvhaven.py"
   install -Dm644 plugins/yt_dlp_plugins/extractor/spankbang.py \
