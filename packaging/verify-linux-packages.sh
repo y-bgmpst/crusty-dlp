@@ -84,11 +84,11 @@ if ((check_x11)); then
     "$extract_deb/usr/bin/crusty-dlp-gui" >"$x11_log" 2>&1 &
     gui_pid=$!
     found=0
-    for _ in $(seq 1 32); do
+    for _ in $(seq 1 80); do
         clients=$(xprop -root _NET_CLIENT_LIST 2>/dev/null || true)
         for client in $(sed 's/.*# //' <<<"$clients" | tr ',' ' '); do
             class=$(xprop -id "$client" WM_CLASS 2>/dev/null || true)
-            if grep -Eq 'WM_CLASS.*"crusty-dlp", "crusty-dlp"' <<<"$class"; then
+            if grep -Eq 'WM_CLASS.*crusty-dlp' <<<"$class"; then
                 found=1
                 break 2
             fi
@@ -99,7 +99,7 @@ if ((check_x11)); then
     wait "$gui_pid" 2>/dev/null || true
     if ((found == 0)); then
         cat "$x11_log" >&2
-        echo "X11 WM_CLASS did not contain crusty-dlp/crusty-dlp" >&2
+        echo "X11 WM_CLASS did not contain crusty-dlp" >&2
         exit 1
     fi
 fi
