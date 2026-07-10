@@ -5,7 +5,6 @@ use std::{
     process::{Command as StdCommand, Stdio},
 };
 
-use directories::ProjectDirs;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::Command as TokioCommand,
@@ -288,28 +287,32 @@ impl Downloader {
 }
 
 fn plugin_directory() -> Option<PathBuf> {
-    let executable = std::env::current_exe().ok()?;
-    let directory = executable.parent()?;
-    let development_root = directory
-        .ancestors()
-        .take(4)
-        .find(|path| {
-            path.join("Cargo.toml").is_file()
-                && path.join("src/downloader.rs").is_file()
-                && path.join("plugins/yt_dlp_plugins/extractor").is_dir()
-        })
-        .map(Path::to_owned);
-    let user_data_directory = ProjectDirs::from("org", "crusty-dlp", "crusty-dlp")
-        .map(|dirs| dirs.data_local_dir().to_path_buf());
+    #[cfg(debug_assertions)]
+    let development_root = std::env::current_exe()
+        .ok()
+        .and_then(|executable| executable.parent().map(Path::to_owned))
+        .and_then(|directory| {
+            directory
+                .ancestors()
+                .take(4)
+                .find(|path| {
+                    path.join("Cargo.toml").is_file()
+                        && path.join("src/downloader.rs").is_file()
+                        && path.join("plugins/yt_dlp_plugins/extractor").is_dir()
+                })
+                .map(Path::to_owned)
+        });
     #[cfg(unix)]
     let system_directory = Some(PathBuf::from("/usr/share/crusty-dlp"));
     #[cfg(not(unix))]
     let system_directory: Option<PathBuf> = None;
-    std::iter::once(directory.to_path_buf())
-        .chain(development_root)
-        .chain(user_data_directory)
-        .chain(system_directory)
-        .find(|path| path.join("plugins/yt_dlp_plugins/extractor").is_dir())
+    #[cfg(debug_assertions)]
+    let mut roots = std::iter::once(development_root)
+        .chain(system_directory.map(Some))
+        .flatten();
+    #[cfg(not(debug_assertions))]
+    let mut roots = system_directory.into_iter();
+    roots.find(|path| path.join("plugins/yt_dlp_plugins/extractor").is_dir())
 }
 
 fn failure_message(lines: &VecDeque<String>) -> String {
@@ -426,19 +429,21 @@ pub fn dependency_path(name: &str) -> Option<PathBuf> {
             let candidate = directory.join(format!("{name}.exe"));
             #[cfg(not(windows))]
             let candidate = directory.join(name);
-            if is_executable(&candidate) {
+            if is_trusted_executable(&candidate) {
                 return Some(candidate);
             }
         }
     }
     let paths = std::env::var_os("PATH")?;
-    std::env::split_paths(&paths).find_map(|dir| {
-        #[cfg(windows)]
-        let candidate = dir.join(format!("{name}.exe"));
-        #[cfg(not(windows))]
-        let candidate = dir.join(name);
-        is_executable(&candidate).then_some(candidate)
-    })
+    std::env::split_paths(&paths)
+        .filter(|dir| dir.is_absolute())
+        .find_map(|dir| {
+            #[cfg(windows)]
+            let candidate = dir.join(format!("{name}.exe"));
+            #[cfg(not(windows))]
+            let candidate = dir.join(name);
+            is_trusted_executable(&candidate).then_some(candidate)
+        })
 }
 
 pub fn supports_playlist_expansion(url: &str) -> bool {
@@ -495,7 +500,8 @@ pub fn expand_playlist_urls(
 pub fn playlist_title(executable: &Path, url: &str) -> Option<String> {
     if is_pmvhaven_playlist_url(url) {
         let canonical = canonical_pmvhaven_playlist_url(url);
-        let output = StdCommand::new("curl")
+        let curl = dependency_path("curl")?;
+        let output = StdCommand::new(curl)
             .args(["-fsSL", "--connect-timeout", "15", "--max-time", "60", "--"])
             .arg(canonical)
             .output()
@@ -566,7 +572,9 @@ fn expand_pmvhaven_playlist_urls(
     url: &str,
 ) -> Result<Option<Vec<PlaylistEntry>>, String> {
     let canonical_url = canonical_pmvhaven_playlist_url(url);
-    let html_output = StdCommand::new("curl")
+    let curl = dependency_path("curl")
+        .ok_or_else(|| "curl was not found in trusted executable paths".to_owned())?;
+    let html_output = StdCommand::new(curl)
         .args(["-fsSL", "--connect-timeout", "15", "--max-time", "60", "--"])
         .arg(&canonical_url)
         .output()
@@ -898,6 +906,23 @@ fn is_executable(path: &Path) -> bool {
     path.metadata()
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+fn is_trusted_executable(path: &Path) -> bool {
+    if !is_executable(path) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        path.parent()
+            .and_then(|parent| parent.metadata().ok())
+            .is_some_and(|metadata| metadata.permissions().mode() & 0o022 == 0)
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 #[cfg(not(unix))]
