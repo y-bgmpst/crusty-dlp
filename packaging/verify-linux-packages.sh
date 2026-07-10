@@ -65,7 +65,8 @@ smoke_gui() {
     local root=$1
     local log=$2
     set +e
-    timeout --signal=TERM 8s env HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/config" "$root/usr/bin/crusty-dlp-gui" >"$log" 2>&1
+    timeout --signal=TERM 8s env WINIT_UNIX_BACKEND=x11 HOME="$tmp/home" \
+        XDG_CONFIG_HOME="$tmp/config" "$root/usr/bin/crusty-dlp-gui" >"$log" 2>&1
     local status=$?
     set -e
     # A GUI has no automatic exit path; timeout is the expected result.
@@ -81,7 +82,7 @@ if ((check_x11)); then
     smoke_gui "$extract_deb" "$tmp/x11.log"
     smoke_gui "$extract_rpm" "$tmp/x11-rpm.log"
     x11_log="$tmp/x11-identity.log"
-    "$extract_deb/usr/bin/crusty-dlp-gui" >"$x11_log" 2>&1 &
+    WINIT_UNIX_BACKEND=x11 "$extract_deb/usr/bin/crusty-dlp-gui" >"$x11_log" 2>&1 &
     gui_pid=$!
     found=0
     for _ in $(seq 1 80); do
