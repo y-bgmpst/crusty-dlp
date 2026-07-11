@@ -122,14 +122,14 @@ pub fn normalize_output_dir(path: &Path) -> Result<PathBuf, String> {
     if path.as_os_str().is_empty() {
         return Err("Output folder cannot be empty".into());
     }
-    if !path.is_absolute() {
-        return Err("Output folder must be an absolute path".into());
-    }
     if path
         .components()
         .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
         return Err("Output folder cannot contain '.' or '..' segments".into());
+    }
+    if !path.is_absolute() {
+        return Err("Output folder must be an absolute path".into());
     }
 
     let normalized = if path.exists() {
@@ -151,6 +151,13 @@ pub fn normalize_output_dir(path: &Path) -> Result<PathBuf, String> {
             return Err("Output folder parent directory must exist".into());
         }
     }
+
+    #[cfg(windows)]
+    let normalized = normalized
+        .to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(normalized);
 
     Ok(normalized)
 }
