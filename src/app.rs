@@ -9,6 +9,7 @@ use crate::{
         validate_output_template, validate_rate_limit, DownloadEvent, DownloadOptions,
     },
     errors::AppError,
+    redaction::{display_url, redact_message},
     search::{open_platform_search, SearchPlatform},
 };
 
@@ -99,6 +100,10 @@ pub struct App {
 }
 
 impl App {
+    fn set_message(&mut self, message: impl Into<String>) {
+        self.message = redact_message(&message.into(), self.debug);
+    }
+
     pub fn new(
         config: Config,
         config_path: PathBuf,
@@ -275,9 +280,11 @@ impl App {
 
     pub fn open_search(&mut self) {
         match open_platform_search(&self.search_query, self.search_platform()) {
-            Ok(url) => {
-                self.message = format!("Opened {} search: {url}", self.search_platform().label())
-            }
+            Ok(url) => self.set_message(format!(
+                "Opened {} search: {}",
+                self.search_platform().label(),
+                display_url(&url, self.debug)
+            )),
             Err(error) => self.message = error.to_string(),
         }
     }
@@ -443,14 +450,14 @@ impl App {
         item.state = DownloadState::Failed;
         self.queue.push_front(item);
         self.clamp_queue_offset();
-        self.message = message.into();
+        self.set_message(message);
     }
 
     pub fn finish_dry_run(&mut self, mut item: QueueItem, command: String) {
         item.state = DownloadState::Finished;
         self.queue.push_back(item);
         self.clamp_queue_offset();
-        self.message = format!("Dry run: {command}");
+        self.set_message(format!("Dry run: {command}"));
         if self
             .queue
             .iter()
@@ -492,7 +499,7 @@ impl App {
         }
         self.clamp_queue_offset();
         self.cancel_tx = None;
-        self.message = message.into();
+        self.set_message(message);
         if state == DownloadState::Finished
             && self
                 .queue

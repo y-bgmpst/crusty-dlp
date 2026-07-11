@@ -34,6 +34,7 @@ pub struct Config {
     pub search_platform: String,
     pub gui_theme: String,
     pub gui_opacity: f32,
+    pub show_sensitive_urls: bool,
 }
 
 impl Default for Config {
@@ -63,6 +64,7 @@ impl Default for Config {
             search_platform: "youtube".into(),
             gui_theme: "graphite".into(),
             gui_opacity: 0.96,
+            show_sensitive_urls: false,
         }
     }
 }

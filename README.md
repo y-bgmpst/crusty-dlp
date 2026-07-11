@@ -363,4 +363,4 @@ you use. This project does not bypass DRM or platform access controls.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+GNU GPL v3.0 or later. See [`LICENSE`](LICENSE).

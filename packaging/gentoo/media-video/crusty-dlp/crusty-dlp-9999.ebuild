@@ -6,7 +6,7 @@ DESCRIPTION="Safe terminal and desktop interfaces for yt-dlp"
 HOMEPAGE="https://github.com/y-bgmpst/crusty-dlp"
 EGIT_REPO_URI="https://github.com/y-bgmpst/crusty-dlp.git"
 
-LICENSE="MIT"
+LICENSE="GPL-3"
 SLOT="0"
 KEYWORDS=""
 IUSE=""

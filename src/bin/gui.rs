@@ -22,6 +22,7 @@ use crusty_dlp::{
         validate_rate_limit, validate_retry_count, validate_socket_timeout, DownloadEvent,
         DownloadOptions, Downloader, PlaylistEntry,
     },
+    redaction::{display_url, redact_message},
     search::{open_platform_search, SearchPlatform},
 };
 use eframe::egui::{self, Color32, RichText};
@@ -282,7 +283,7 @@ struct GuiApp {
     event_rx: mpsc::UnboundedReceiver<JobEvent>,
     download_request_tx: mpsc::UnboundedSender<DownloadRequest>,
     impersonation_targets: Vec<String>,
-    logs: VecDeque<String>,
+    logs: VecDeque<LogEntry>,
     status: String,
     folder_picker_rx: Option<Receiver<Result<Option<PathBuf>, String>>>,
     thumbnail_rx: Receiver<QueueThumbnailEvent>,
@@ -297,6 +298,20 @@ struct GuiApp {
     diagnostics: RuntimeDiagnostics,
     diagnostics_rx: Receiver<RuntimeDiagnostics>,
     diagnostics_refresh_pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogLevel {
+    Info,
+    Warning,
+    Error,
+    Debug,
+}
+
+#[derive(Debug, Clone)]
+struct LogEntry {
+    level: LogLevel,
+    message: String,
 }
 
 impl GuiApp {
@@ -487,17 +502,29 @@ impl GuiApp {
     fn open_search(&mut self) {
         match open_platform_search(&self.search_query, self.search_platform()) {
             Ok(url) => {
-                self.status = format!("Opened {} search: {url}", self.search_platform().label())
+                self.status = format!(
+                    "Opened {} search: {}",
+                    self.search_platform().label(),
+                    display_url(&url, self.config.show_sensitive_urls)
+                )
             }
             Err(error) => self.status = error.to_string(),
         }
     }
 
     fn log(&mut self, message: impl Into<String>) {
+        self.log_level(LogLevel::Info, message);
+    }
+
+    fn log_level(&mut self, level: LogLevel, message: impl Into<String>) {
+        let message = redact_message(
+            &message.into(),
+            self.config.show_sensitive_urls || cfg!(debug_assertions),
+        );
         if self.logs.len() == 200 {
             self.logs.pop_front();
         }
-        self.logs.push_back(message.into());
+        self.logs.push_back(LogEntry { level, message });
     }
 
     fn add_input(&mut self) {
@@ -511,7 +538,7 @@ impl GuiApp {
         for url in values {
             match self.expand_or_enqueue(&url) {
                 Ok(count) => added += count,
-                Err(error) => self.log(format!("Rejected URL: {error}")),
+                Err(error) => self.log_level(LogLevel::Warning, format!("Rejected URL: {error}")),
             }
         }
         if added > 0 {
@@ -915,7 +942,7 @@ impl GuiApp {
         self.queue[index].error = Some(message.clone());
         self.queue_layout_dirty = true;
         self.status = message.clone();
-        self.log(format!("ERROR: {message}"));
+        self.log_level(LogLevel::Error, format!("ERROR: {message}"));
     }
 
     fn cancel(&mut self) {
@@ -988,18 +1015,25 @@ impl GuiApp {
                 DownloadEvent::Failed(message) => {
                     self.queue_layout_dirty = true;
                     let message = friendly_error(&self.queue[index].url, &message);
+                    let display_message = redact_message(
+                        &message,
+                        self.config.show_sensitive_urls || cfg!(debug_assertions),
+                    );
                     self.queue[index].state = DownloadState::Failed;
-                    self.queue[index].error = Some(message.clone());
+                    self.queue[index].error = Some(display_message.clone());
                     self.active_downloads.remove(&job.id);
-                    self.log(format!("ERROR: {message}"));
-                    self.status = message;
+                    self.log_level(LogLevel::Error, format!("ERROR: {display_message}"));
+                    self.status = display_message;
                 }
                 DownloadEvent::Cancelled => {
                     self.queue_layout_dirty = true;
                     self.queue[index].state = DownloadState::Cancelled;
                     self.queue[index].progress_text = "cancelled".into();
                     self.active_downloads.remove(&job.id);
-                    self.log(format!("Cancelled: {}", self.queue[index].url));
+                    self.log(format!(
+                        "Cancelled: {}",
+                        display_url(&self.queue[index].url, self.config.show_sensitive_urls)
+                    ));
                     self.status = "Download cancelled".into();
                 }
             }
@@ -1043,7 +1077,7 @@ impl GuiApp {
                     }
                     self.log(format!(
                         "Expanded playlist into {count} new item(s): {}",
-                        event.url
+                        display_url(&event.url, self.config.show_sensitive_urls)
                     ));
                     self.status = format!("Added {count} new playlist item(s) to the queue");
                 }
@@ -1053,11 +1087,17 @@ impl GuiApp {
                         event.url
                     );
                     self.log(format!("Playlist expansion failed: {message}"));
-                    self.status = message;
+                    self.status = redact_message(
+                        &message,
+                        self.config.show_sensitive_urls || cfg!(debug_assertions),
+                    );
                 }
                 Err(error) => {
                     self.log(format!("Playlist expansion failed: {error}"));
-                    self.status = error;
+                    self.status = redact_message(
+                        &error,
+                        self.config.show_sensitive_urls || cfg!(debug_assertions),
+                    );
                 }
             }
         }
@@ -1066,6 +1106,7 @@ impl GuiApp {
             self.diagnostics = diagnostics;
             self.diagnostics_refresh_pending = false;
             self.status = "Diagnostics refreshed".into();
+            self.log_level(LogLevel::Debug, "Diagnostics refreshed");
         }
 
         if self.queue_running {
@@ -1551,6 +1592,16 @@ impl GuiApp {
             self.save_config();
         }
         ui.small("Passed as one safe --extractor-args value; leave blank for yt-dlp defaults.");
+        if ui
+            .checkbox(
+                &mut self.config.show_sensitive_urls,
+                "Show full URLs (privacy risk)",
+            )
+            .changed()
+        {
+            self.save_config();
+        }
+        ui.small("Disabled by default; enables full query strings in status and logs.");
 
         ui.horizontal(|ui| {
             ui.label("Speed limit");
@@ -1768,7 +1819,7 @@ impl GuiApp {
                             visible_ids.insert(self.queue[index].id);
                             self.request_thumbnail(index);
                             let item = &self.queue[index];
-                            queue_row(ui, index, item);
+                            queue_row(ui, index, item, self.config.show_sensitive_urls);
                             ui.add_space(6.0);
                         }
 
@@ -1831,9 +1882,12 @@ impl GuiApp {
                                 );
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(item.url.as_ref())
-                                            .size(12.0)
-                                            .color(Color32::GRAY),
+                                        RichText::new(display_url(
+                                            &item.url,
+                                            self.config.show_sensitive_urls,
+                                        ))
+                                        .size(12.0)
+                                        .color(Color32::GRAY),
                                     )
                                     .truncate(),
                                 );
@@ -1923,10 +1977,18 @@ impl GuiApp {
                 .stick_to_bottom(true)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    for line in &self.logs {
+                    for entry in &self.logs {
+                        let color = match entry.level {
+                            LogLevel::Info => Color32::LIGHT_GRAY,
+                            LogLevel::Warning => AMBER,
+                            LogLevel::Error => RED,
+                            LogLevel::Debug => Color32::GRAY,
+                        };
                         ui.add(
-                            egui::Label::new(egui::RichText::new(line).monospace())
-                                .selectable(true),
+                            egui::Label::new(
+                                egui::RichText::new(&entry.message).monospace().color(color),
+                            )
+                            .selectable(true),
                         );
                     }
                 });
@@ -2384,7 +2446,7 @@ fn text_edit_with_context_menu(
     response
 }
 
-fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
+fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem, show_sensitive_urls: bool) {
     let expected_outer_height = queue_row_height(item, ui.available_width()) - 6.0;
     egui::Frame::group(ui.style())
         .fill(PANEL_ALT)
@@ -2427,7 +2489,7 @@ fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
                             );
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(item.url.as_ref())
+                                    RichText::new(display_url(&item.url, show_sensitive_urls))
                                         .size(12.0)
                                         .color(Color32::GRAY),
                                 )
@@ -2491,7 +2553,7 @@ fn queue_row(ui: &mut egui::Ui, index: usize, item: &GuiQueueItem) {
                         );
                         ui.add(
                             egui::Label::new(
-                                RichText::new(item.url.as_ref())
+                                RichText::new(display_url(&item.url, show_sensitive_urls))
                                     .size(12.0)
                                     .color(Color32::GRAY),
                             )

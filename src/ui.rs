@@ -6,7 +6,10 @@ use ratatui::{
     Frame,
 };
 
-use crusty_dlp::app::{App, DownloadMode, DownloadState, Panel};
+use crusty_dlp::{
+    app::{App, DownloadMode, DownloadState, Panel},
+    redaction::display_url,
+};
 
 const MIN_WIDTH: u16 = 70;
 const MIN_HEIGHT: u16 = 22;
@@ -200,7 +203,7 @@ fn render_queue(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(item) = &app.current {
         items.push(ListItem::new(Line::from(vec![
             Span::styled("▶ Downloading  ", Style::default().fg(Color::Yellow)),
-            Span::raw(&item.url),
+            Span::raw(display_url(&item.url, app.debug)),
         ])));
     }
     items.extend(app.queue.iter().map(|item| {
@@ -215,7 +218,7 @@ fn render_queue(frame: &mut Frame, area: Rect, app: &App) {
                 format!("{:<11}  ", item.state.label()),
                 Style::default().fg(color),
             ),
-            Span::raw(&item.url),
+            Span::raw(display_url(&item.url, app.debug)),
         ]))
     }));
     if items.is_empty() {

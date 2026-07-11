@@ -2,7 +2,7 @@
 name = "crusty-dlp"
 version = "0.6.1"
 edition = "2021"
-license = "MIT"
+license = "GPL-3.0-or-later"
 description = "Safe terminal and desktop interfaces for yt-dlp"
 repository = "https://github.com/y-bgmpst/crusty-dlp"
 build = "build.rs"
@@ -79,7 +79,7 @@ assets = [
 [package.metadata.generate-rpm]
 name = "crusty-dlp"
 summary = "Safe terminal and desktop interfaces for yt-dlp"
-license = "MIT"
+license = "GPL-3.0-or-later"
 auto-req = "auto"
 assets = [
   { source = "target/release/crusty-dlp", dest = "/usr/bin/crusty-dlp", mode = "755" },
