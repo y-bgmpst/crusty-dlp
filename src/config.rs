@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::Write,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use anyhow::{Context, Result};
@@ -41,7 +41,8 @@ impl Default for Config {
     fn default() -> Self {
         let output_dir = BaseDirs::new()
             .map(|dirs| dirs.home_dir().join("Downloads"))
-            .unwrap_or_else(|| PathBuf::from("."));
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
         Self {
             output_dir,
             output_template: "%(title)s [%(id)s].%(ext)s".into(),
@@ -82,7 +83,12 @@ impl Config {
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("could not read {}", path.display()))?;
-        toml::from_str(&text).with_context(|| format!("invalid config file: {}", path.display()))
+        let mut config: Self = toml::from_str(&text)
+            .with_context(|| format!("invalid config file: {}", path.display()))?;
+        config.output_dir = normalize_output_dir(&config.output_dir)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("invalid output_dir in {}", path.display()))?;
+        Ok(config)
     }
 
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -102,6 +108,58 @@ impl Config {
         replace_file(&temporary, path)
             .with_context(|| format!("could not replace {}", path.display()))
     }
+}
+
+pub fn validate_output_dir(value: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("Output folder cannot be empty".into());
+    }
+    normalize_output_dir(Path::new(trimmed))
+}
+
+pub fn normalize_output_dir(path: &Path) -> Result<PathBuf, String> {
+    if path.as_os_str().is_empty() {
+        return Err("Output folder cannot be empty".into());
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err("Output folder cannot contain '.' or '..' segments".into());
+    }
+    if !path.is_absolute() {
+        return Err("Output folder must be an absolute path".into());
+    }
+
+    let normalized = if path.exists() {
+        path.canonicalize()
+            .map_err(|error| format!("could not access output folder: {error}"))?
+    } else {
+        path.to_path_buf()
+    };
+
+    if normalized.exists() && !normalized.is_dir() {
+        return Err("Output folder must point to a directory".into());
+    }
+
+    if !normalized.exists() {
+        let Some(parent) = normalized.parent() else {
+            return Err("Output folder must have an existing parent directory".into());
+        };
+        if !parent.is_dir() {
+            return Err("Output folder parent directory must exist".into());
+        }
+    }
+
+    #[cfg(windows)]
+    let normalized = normalized
+        .to_string_lossy()
+        .strip_prefix(r"\\?\")
+        .map(PathBuf::from)
+        .unwrap_or(normalized);
+
+    Ok(normalized)
 }
 
 #[cfg(not(windows))]
@@ -136,9 +194,14 @@ mod tests {
     fn loads_partial_config_with_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
-        fs::write(&path, "output_dir = '/tmp/media'\n").unwrap();
+        let output_dir = dir.path().join("media");
+        fs::write(
+            &path,
+            format!("output_dir = {:?}\n", output_dir.display().to_string()),
+        )
+        .unwrap();
         let config = Config::load(&path).unwrap();
-        assert_eq!(config.output_dir, PathBuf::from("/tmp/media"));
+        assert_eq!(config.output_dir, output_dir);
         assert_eq!(config.output_template, "%(title)s [%(id)s].%(ext)s");
         assert_eq!(config.default_mode, "video");
         assert_eq!(config.rate_limit, "");
@@ -162,5 +225,24 @@ mod tests {
         let config = Config::default();
         config.save(&path).unwrap();
         assert_eq!(Config::load(&path).unwrap(), config);
+    }
+
+    #[test]
+    fn rejects_relative_output_dir() {
+        let error = validate_output_dir("downloads").unwrap_err();
+        assert!(error.contains("absolute path"));
+    }
+
+    #[test]
+    fn rejects_parent_segments_in_output_dir() {
+        let error = validate_output_dir("/tmp/../downloads").unwrap_err();
+        assert!(error.contains("'.' or '..'"));
+    }
+
+    #[test]
+    fn accepts_missing_absolute_output_dir_with_existing_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let output_dir = dir.path().join("downloads");
+        assert_eq!(normalize_output_dir(&output_dir).unwrap(), output_dir);
     }
 }

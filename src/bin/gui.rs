@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet, VecDeque},
     io::Read,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs},
     path::PathBuf,
     process::Command as StdCommand,
     sync::{
@@ -14,7 +15,7 @@ use std::{
 use arboard::Clipboard;
 use crusty_dlp::{
     app::{validate_url, DownloadMode, DownloadState},
-    config::Config,
+    config::{normalize_output_dir, validate_output_dir, Config},
     downloader::{
         available_impersonation_targets, current_executable_path, dependency_path,
         expand_playlist_urls, playlist_title, resolve_network_tuning, resolved_plugin_directory,
@@ -28,6 +29,7 @@ use crusty_dlp::{
 use eframe::egui::{self, Color32, RichText};
 use image::ImageReader;
 use tokio::sync::{mpsc, oneshot};
+use url::Url;
 
 const BLUE: Color32 = Color32::from_rgb(47, 128, 237);
 const GREEN: Color32 = Color32::from_rgb(72, 180, 90);
@@ -350,6 +352,7 @@ impl GuiApp {
         let thumbnail_request_rx = Arc::new(Mutex::new(thumbnail_request_rx));
         let thumbnail_cache_dir = thumbnail_cache_directory();
         let thumbnail_client = reqwest::blocking::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(Duration::from_secs(15))
             .build()
             .map_err(|error| format!("thumbnail client error: {error}"));
@@ -736,13 +739,15 @@ impl GuiApp {
     }
 
     fn apply_output_dir(&mut self) -> bool {
-        let trimmed = self.output_dir_text.trim();
-        if trimmed.is_empty() {
-            self.status = "Output folder cannot be empty".into();
-            return false;
-        }
-        self.config.output_dir = PathBuf::from(trimmed);
-        self.output_dir_text = trimmed.to_owned();
+        let path = match validate_output_dir(&self.output_dir_text) {
+            Ok(path) => path,
+            Err(error) => {
+                self.status = error;
+                return false;
+            }
+        };
+        self.config.output_dir = path;
+        self.output_dir_text = self.config.output_dir.display().to_string();
         self.save_config();
         true
     }
@@ -1176,6 +1181,13 @@ impl GuiApp {
 
         match receiver.try_recv() {
             Ok(Ok(Some(path))) => {
+                let path = match normalize_output_dir(&path) {
+                    Ok(path) => path,
+                    Err(error) => {
+                        self.status = error;
+                        return;
+                    }
+                };
                 self.config.output_dir = path.clone();
                 self.output_dir_text = path.display().to_string();
                 self.save_config();
@@ -2770,6 +2782,8 @@ fn download_thumbnail(
     url: &str,
     cache_dir: Option<&std::path::Path>,
 ) -> Result<DecodedThumbnail, String> {
+    let parsed_url = validate_thumbnail_url(url)?;
+
     if let Some(cache_path) = cache_dir.and_then(|dir| thumbnail_cache_path(dir, url)) {
         if cache_path.is_file() {
             match decode_thumbnail_from_path(&cache_path) {
@@ -2782,7 +2796,7 @@ fn download_thumbnail(
     }
 
     let response = client
-        .get(url)
+        .get(parsed_url)
         .send()
         .and_then(|response| response.error_for_status())
         .map_err(|error| format!("thumbnail request failed: {error}"))?;
@@ -2826,6 +2840,86 @@ fn download_thumbnail(
         width,
         height,
     })
+}
+
+fn validate_thumbnail_url(url: &str) -> Result<Url, String> {
+    let parsed = Url::parse(url).map_err(|_| "thumbnail URL is invalid".to_owned())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("thumbnail URL must use http or https".into());
+    }
+    if parsed.host_str().is_none() {
+        return Err("thumbnail URL is missing a host".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("thumbnail URL cannot include credentials".into());
+    }
+
+    let host = parsed
+        .host_str()
+        .ok_or_else(|| "thumbnail URL is missing a host".to_owned())?;
+    if host.eq_ignore_ascii_case("localhost") {
+        return Err("thumbnail URL cannot target localhost".into());
+    }
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_forbidden_ip(ip) {
+            return Err("thumbnail URL cannot target private or reserved addresses".into());
+        }
+        return Ok(parsed);
+    }
+
+    let port = parsed
+        .port_or_known_default()
+        .ok_or_else(|| "thumbnail URL is missing a known port".to_owned())?;
+    let resolved = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("thumbnail host resolution failed: {error}"))?
+        .map(|addr| addr.ip())
+        .collect::<Vec<_>>();
+    if resolved.is_empty() {
+        return Err("thumbnail host did not resolve to an address".into());
+    }
+    if resolved.iter().any(|ip| is_forbidden_ip(*ip)) {
+        return Err("thumbnail URL cannot target private or reserved addresses".into());
+    }
+
+    Ok(parsed)
+}
+
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_forbidden_ipv4(ip),
+        IpAddr::V6(ip) => is_forbidden_ipv6(ip),
+    }
+}
+
+fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+        || first == 0
+        || (first == 100 && (second & 0b1100_0000) == 0b0100_0000)
+        || (first == 198 && matches!(second, 18 | 19))
+        || first >= 240
+}
+
+fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(mapped) = ip.to_ipv4_mapped() {
+        return is_forbidden_ipv4(mapped);
+    }
+
+    let [first, second, ..] = ip.segments();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || ip.is_multicast()
+        || (first & 0xffc0) == 0xfec0
+        || (first == 0x2001 && second == 0x0db8)
 }
 
 fn thumbnail_cache_directory() -> Option<PathBuf> {
@@ -3040,4 +3134,33 @@ fn days_from_civil((year, month, day): (i32, u32, u32)) -> i64 {
     let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     (era * 146097 + doe - 719468) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_thumbnail_url;
+
+    #[test]
+    fn rejects_thumbnail_urls_with_credentials() {
+        let error =
+            validate_thumbnail_url("https://user:secret@example.com/thumb.jpg").unwrap_err();
+        assert!(error.contains("credentials"));
+    }
+
+    #[test]
+    fn rejects_private_thumbnail_targets() {
+        let error = validate_thumbnail_url("http://127.0.0.1/thumb.jpg").unwrap_err();
+        assert!(error.contains("private or reserved"));
+    }
+
+    #[test]
+    fn rejects_localhost_thumbnail_targets() {
+        let error = validate_thumbnail_url("https://localhost/thumb.jpg").unwrap_err();
+        assert!(error.contains("localhost"));
+    }
+
+    #[test]
+    fn accepts_public_thumbnail_targets() {
+        assert!(validate_thumbnail_url("https://93.184.216.34/thumb.jpg").is_ok());
+    }
 }
