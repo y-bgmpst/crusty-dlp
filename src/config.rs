@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::errors::AppError;
 
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Config {
@@ -80,6 +82,16 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         if !path.exists() {
             return Ok(Self::default());
+        }
+        let size = fs::metadata(path)
+            .with_context(|| format!("could not inspect {}", path.display()))?
+            .len();
+        if size > MAX_CONFIG_BYTES {
+            return Err(AppError::Config(format!(
+                "configuration file exceeds the 1 MiB limit: {}",
+                path.display()
+            ))
+            .into());
         }
         let text = fs::read_to_string(path)
             .with_context(|| format!("could not read {}", path.display()))?;
@@ -216,6 +228,15 @@ mod tests {
         assert_eq!(config.search_platform, "youtube");
         assert_eq!(config.gui_theme, "graphite");
         assert_eq!(config.gui_opacity, 0.96);
+    }
+
+    #[test]
+    fn rejects_oversized_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, vec![b'x'; (MAX_CONFIG_BYTES + 1) as usize]).unwrap();
+        let error = Config::load(&path).unwrap_err().to_string();
+        assert!(error.contains("exceeds the 1 MiB limit"));
     }
 
     #[test]

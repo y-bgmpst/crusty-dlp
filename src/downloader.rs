@@ -1,6 +1,7 @@
 use std::{
     collections::{HashSet, VecDeque},
     ffi::OsString,
+    io::Read,
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
 };
@@ -14,6 +15,7 @@ use tokio::{
 use crate::app::DownloadMode;
 
 const PROGRESS_PREFIX: &str = "crusty-dlp:";
+const MAX_PLAYLIST_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum DownloadEvent {
@@ -325,6 +327,57 @@ fn failure_message(lines: &VecDeque<String>) -> String {
         .unwrap_or_default()
 }
 
+fn bounded_command_output(
+    command: &mut StdCommand,
+    limit: u64,
+) -> Result<std::process::Output, String> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "could not capture command stdout".to_owned())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "could not capture command stderr".to_owned())?;
+    let stdout_limit = limit.saturating_add(1);
+    let stdout_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout
+            .take(stdout_limit)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr
+            .take(stdout_limit)
+            .read_to_end(&mut bytes)
+            .map(|_| bytes)
+    });
+    let status = child.wait().map_err(|error| error.to_string())?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| "stdout reader thread panicked".to_owned())?
+        .map_err(|error| error.to_string())?;
+    let stderr = stderr_thread
+        .join()
+        .map_err(|_| "stderr reader thread panicked".to_owned())?
+        .map_err(|error| error.to_string())?;
+    if stdout.len() as u64 > limit || stderr.len() as u64 > limit {
+        return Err(format!("command output exceeds the {limit} byte limit"));
+    }
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 #[cfg(unix)]
 async fn terminate_process_tree(child: &mut tokio::process::Child) {
     let Some(pid) = child.id() else {
@@ -468,9 +521,7 @@ pub fn expand_playlist_urls(
         command.arg("--plugin-dirs").arg(plugin_dir);
     }
     command.args(playlist_probe_arguments());
-    let output = command
-        .arg(url)
-        .output()
+    let output = bounded_command_output(command.arg(url), MAX_PLAYLIST_OUTPUT_BYTES)
         .map_err(|error| format!("could not inspect playlist: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -501,11 +552,13 @@ pub fn playlist_title(executable: &Path, url: &str) -> Option<String> {
     if is_pmvhaven_playlist_url(url) {
         let canonical = canonical_pmvhaven_playlist_url(url);
         let curl = dependency_path("curl")?;
-        let output = StdCommand::new(curl)
-            .args(["-fsSL", "--connect-timeout", "15", "--max-time", "60", "--"])
-            .arg(canonical)
-            .output()
-            .ok()?;
+        let output = bounded_command_output(
+            StdCommand::new(curl)
+                .args(["-fsSL", "--connect-timeout", "15", "--max-time", "60", "--"])
+                .arg(canonical),
+            MAX_PLAYLIST_OUTPUT_BYTES,
+        )
+        .ok()?;
         let html = String::from_utf8_lossy(&output.stdout);
         return extract_html_title(&html);
     }
@@ -522,7 +575,8 @@ pub fn playlist_title(executable: &Path, url: &str) -> Option<String> {
     if let Some(plugin_dir) = plugin_directory() {
         command.arg("--plugin-dirs").arg(plugin_dir);
     }
-    let output = command.arg("--").arg(url).output().ok()?;
+    let output =
+        bounded_command_output(command.arg("--").arg(url), MAX_PLAYLIST_OUTPUT_BYTES).ok()?;
     if !output.status.success() {
         return None;
     }
@@ -574,11 +628,13 @@ fn expand_pmvhaven_playlist_urls(
     let canonical_url = canonical_pmvhaven_playlist_url(url);
     let curl = dependency_path("curl")
         .ok_or_else(|| "curl was not found in trusted executable paths".to_owned())?;
-    let html_output = StdCommand::new(curl)
-        .args(["-fsSL", "--connect-timeout", "15", "--max-time", "60", "--"])
-        .arg(&canonical_url)
-        .output()
-        .map_err(|error| format!("could not inspect PMVHaven playlist HTML: {error}"))?;
+    let html_output = bounded_command_output(
+        StdCommand::new(curl)
+            .args(["-fsSL", "--connect-timeout", "15", "--max-time", "60", "--"])
+            .arg(&canonical_url),
+        MAX_PLAYLIST_OUTPUT_BYTES,
+    )
+    .map_err(|error| format!("could not inspect PMVHaven playlist HTML: {error}"))?;
     if html_output.status.success() {
         let html = String::from_utf8_lossy(&html_output.stdout);
         let entries = dedupe_playlist_entries(parse_pmvhaven_itemlist_entries(&html));
@@ -597,9 +653,7 @@ fn expand_pmvhaven_playlist_urls(
         command.arg("--plugin-dirs").arg(plugin_dir);
     }
     command.args(playlist_probe_arguments());
-    let output = command
-        .arg(&canonical_url)
-        .output()
+    let output = bounded_command_output(command.arg(&canonical_url), MAX_PLAYLIST_OUTPUT_BYTES)
         .map_err(|error| format!("could not inspect PMVHaven playlist: {error}"))?;
     let mut yt_dlp_error = None;
     let entries = if output.status.success() {
