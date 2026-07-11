@@ -3,7 +3,7 @@ use std::{collections::VecDeque, path::PathBuf};
 use tokio::sync::oneshot;
 
 use crate::{
-    config::Config,
+    config::{validate_output_dir, Config},
     downloader::{
         resolve_network_tuning, supports_playlist_expansion, validate_extractor_args,
         validate_output_template, validate_rate_limit, DownloadEvent, DownloadOptions,
@@ -243,11 +243,13 @@ impl App {
                 self.input.clear();
             }
             Panel::Output => {
-                if self.input.trim().is_empty() {
-                    self.message = "Output folder cannot be empty".into();
-                    return;
+                match validate_output_dir(&self.input) {
+                    Ok(path) => self.config.output_dir = path,
+                    Err(error) => {
+                        self.message = error;
+                        return;
+                    }
                 }
-                self.config.output_dir = PathBuf::from(self.input.trim());
                 self.editing = false;
                 self.input.clear();
                 self.save_config();
@@ -526,12 +528,12 @@ impl App {
 }
 
 pub fn validate_url(value: &str) -> Result<(), AppError> {
-    let valid_scheme = value.starts_with("https://") || value.starts_with("http://");
-    let remainder = value
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or_default();
-    if valid_scheme && !remainder.is_empty() && !remainder.chars().any(char::is_whitespace) {
+    let parsed = url::Url::parse(value).map_err(|_| AppError::InvalidUrl)?;
+    if matches!(parsed.scheme(), "http" | "https")
+        && parsed.host_str().is_some()
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+    {
         Ok(())
     } else {
         Err(AppError::InvalidUrl)
@@ -571,12 +573,17 @@ mod tests {
     }
     #[test]
     fn rejects_shell_text_and_relative_values() {
-        assert!(validate_url("https://example.com/x; rm").is_err());
+        assert!(validate_url("https://exa mple.com/video").is_err());
         assert!(validate_url("example.com/video").is_err());
     }
     #[test]
     fn rejects_empty_host() {
         assert!(validate_url("https://").is_err());
+    }
+
+    #[test]
+    fn rejects_urls_with_credentials() {
+        assert!(validate_url("https://user:secret@example.com/video").is_err());
     }
 
     #[test]
