@@ -19,7 +19,7 @@ use crusty_dlp::{
     config::{normalize_output_dir, validate_output_dir, Config},
     downloader::{
         available_impersonation_targets, current_executable_path, dependency_path,
-        expand_playlist_urls, resolve_network_tuning, resolved_plugin_directory,
+        expand_playlist_urls, playlist_title, resolve_network_tuning, resolved_plugin_directory,
         sanitize_filename_component, supports_playlist_expansion, validate_output_template,
         validate_rate_limit, validate_retry_count, validate_socket_timeout, DownloadEvent,
         DownloadOptions, Downloader, PlaylistEntry,
@@ -390,9 +390,10 @@ impl GuiApp {
         std::thread::spawn(move || {
             while let Ok(request) = playlist_request_rx.recv() {
                 let result = expand_playlist_urls(&request.executable, &request.url);
+                let playlist_title = playlist_title(&request.executable, &request.url);
                 let _ = playlist_tx.send(PlaylistExpansionEvent {
                     url: request.url,
-                    playlist_title: None,
+                    playlist_title,
                     result,
                 });
             }
@@ -3210,5 +3211,25 @@ mod tests {
     #[test]
     fn accepts_public_thumbnail_targets() {
         assert!(validate_thumbnail_url("https://93.184.216.34/thumb.jpg").is_ok());
+    }
+
+    #[test]
+    fn playlist_folder_name_prefers_title_over_id() {
+        assert_eq!(
+            super::playlist_folder_name(
+                "https://pmvhaven.com/playlists/692b70e2d7984d93b13f83c2",
+                Some("Featured PMVHaven Picks"),
+            )
+            .as_deref(),
+            Some("Featured PMVHaven Picks")
+        );
+        assert_eq!(
+            super::playlist_folder_name(
+                "https://pmvhaven.com/playlists/692b70e2d7984d93b13f83c2",
+                None,
+            )
+            .as_deref(),
+            Some("692b70e2d7984d93b13f83c2")
+        );
     }
 }

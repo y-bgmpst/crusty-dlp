@@ -13,7 +13,7 @@ use tokio::{
     sync::{mpsc, oneshot},
 };
 
-use crate::app::DownloadMode;
+use crate::{app::DownloadMode, urls};
 
 const PROGRESS_PREFIX: &str = "crusty-dlp:";
 const MAX_PLAYLIST_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
@@ -695,11 +695,14 @@ fn expand_pmvhaven_playlist_urls(
         let html = String::from_utf8_lossy(&html_output.stdout);
         let entries = dedupe_playlist_entries(parse_pmvhaven_itemlist_entries(&html));
         if !entries.is_empty() {
-            return Ok(Some(entries));
+            return Ok(Some(enforce_playlist_entry_limit(entries, &canonical_url)?));
         }
         let href_entries = dedupe_playlist_entries(parse_pmvhaven_href_entries(&html));
         if !href_entries.is_empty() {
-            return Ok(Some(href_entries));
+            return Ok(Some(enforce_playlist_entry_limit(
+                href_entries,
+                &canonical_url,
+            )?));
         }
     }
 
@@ -724,7 +727,7 @@ fn expand_pmvhaven_playlist_urls(
                 }
             }
         }
-        dedupe_playlist_entries(parsed_entries)
+        enforce_playlist_entry_limit(dedupe_playlist_entries(parsed_entries), &canonical_url)?
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         yt_dlp_error = Some(
@@ -796,7 +799,7 @@ fn parse_pmvhaven_href_entries(html: &str) -> Vec<PlaylistEntry> {
         if !slug.trim().is_empty() {
             entries.push(PlaylistEntry {
                 title: None,
-                url: format!("https://pmvhaven.com/video/{slug}"),
+                url: urls::pmvhaven_video_url(slug),
                 thumbnail_url: None,
             });
         }
@@ -854,6 +857,18 @@ fn dedupe_playlist_entries(entries: Vec<PlaylistEntry>) -> Vec<PlaylistEntry> {
         }
     }
     deduped
+}
+
+fn enforce_playlist_entry_limit(
+    entries: Vec<PlaylistEntry>,
+    url: &str,
+) -> Result<Vec<PlaylistEntry>, String> {
+    if entries.len() > MAX_PLAYLIST_ENTRIES {
+        return Err(format!(
+            "playlist inspection exceeded the {MAX_PLAYLIST_ENTRIES} entry limit for {url}"
+        ));
+    }
+    Ok(entries)
 }
 
 pub fn validate_output_template(template: &str) -> Result<(), String> {
@@ -1132,9 +1147,9 @@ fn playlist_source(url: &str) -> PlaylistSource {
 fn fallback_playlist_entry_url(source: PlaylistSource, id: Option<&str>) -> Option<String> {
     let id = id?;
     match source {
-        PlaylistSource::YouTube => Some(format!("https://www.youtube.com/watch?v={id}")),
-        PlaylistSource::PmvHaven => Some(format!("https://pmvhaven.com/video/{id}")),
-        PlaylistSource::SpankBang => Some(format!("https://spankbang.com/{id}/video/{id}")),
+        PlaylistSource::YouTube => Some(urls::youtube_watch_url(id)),
+        PlaylistSource::PmvHaven => Some(urls::pmvhaven_video_url(id)),
+        PlaylistSource::SpankBang => Some(urls::spankbang_video_url(id)),
     }
 }
 
@@ -1661,5 +1676,20 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn rejects_playlist_entry_lists_over_the_limit() {
+        let entries = (0..=MAX_PLAYLIST_ENTRIES)
+            .map(|index| PlaylistEntry {
+                title: Some(format!("Item {index}")),
+                url: format!("https://example.com/{index}"),
+                thumbnail_url: None,
+            })
+            .collect();
+
+        let error =
+            enforce_playlist_entry_limit(entries, "https://example.com/playlist").unwrap_err();
+        assert!(error.contains("entry limit"));
     }
 }
