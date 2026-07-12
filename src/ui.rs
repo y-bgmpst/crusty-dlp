@@ -200,7 +200,7 @@ fn render_queue(frame: &mut Frame, area: Rect, app: &App) {
         .constraints([Constraint::Min(3), Constraint::Length(3)])
         .split(area);
     let mut items = Vec::new();
-    if let Some(item) = &app.current {
+    for item in &app.active {
         items.push(ListItem::new(Line::from(vec![
             Span::styled("▶ Downloading  ", Style::default().fg(Color::Yellow)),
             Span::raw(display_url(&item.url, app.debug)),
@@ -258,7 +258,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
         String::new()
     };
     let text = format!(
-        "{}{}   │ cookies:{} │ q quit a add s search p platform o open d download c cancel b browser mouse: queue scroll / click panel ? help",
+        "{}{}   │ cookies:{} │ q quit a add s search p platform o open d download c cancel-all b browser mouse: queue scroll / click panel ? help",
         app.message,
         debug,
         app.cookies_browser_label()
@@ -274,7 +274,7 @@ fn render_status(frame: &mut Frame, area: Rect, app: &App) {
 fn render_help(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(68, 20, area);
     frame.render_widget(Clear, popup);
-    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  s       Edit browser search query\n  p       Cycle browser search platform\n  o       Open current search in browser\n  d       Start/continue queue\n  c       Cancel active download\n  b       Cycle browser cookie source\n  r       Toggle aria2 for direct files\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nMouse\n\n  Wheel   Scroll queue\n  Click   Select a main panel\n\nConnections: 4–8 is usually practical. Above 8 may increase throttling or HTTP 403 risk.\n\nPress any key to close";
+    let text = "Keyboard\n\n  q       Quit safely\n  a       Add one or more URLs\n  s       Edit browser search query\n  p       Cycle browser search platform\n  o       Open current search in browser\n  d       Start/continue queue\n  c       Cancel active download(s)\n  b       Cycle browser cookie source\n  r       Toggle aria2 for direct files\n  Tab     Switch panels\n  Enter   Edit/select current panel\n  Esc     Cancel editing\n  ?       Toggle this help\n\nMouse\n\n  Wheel   Scroll queue\n  Click   Select a main panel\n\nConnections: 4–8 is usually practical. Above 8 may increase throttling or HTTP 403 risk.\n\nPress any key to close";
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::bordered().title(" Help "))
