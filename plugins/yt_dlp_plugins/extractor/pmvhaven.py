@@ -4,7 +4,7 @@ import json
 import re
 
 from yt_dlp.extractor.common import InfoExtractor
-from yt_dlp.utils import ExtractorError, orderedSet, urljoin
+from yt_dlp.utils import ExtractorError, orderedSet, url_or_none, urljoin
 
 
 class PMVHavenIE(InfoExtractor):
@@ -17,7 +17,13 @@ class PMVHavenIE(InfoExtractor):
         info = self._search_json_ld(
             webpage, display_id, expected_type="VideoObject"
         )
-        media_url = info.pop("url")
+        media_url = _media_url(info)
+        if not media_url:
+            raise ExtractorError(
+                "PMVHaven did not publish a valid absolute media URL "
+                "(the page metadata may contain a tag link instead)",
+                expected=True,
+            )
 
         if media_url.endswith(".m3u8"):
             formats = self._extract_m3u8_formats(
@@ -39,6 +45,30 @@ class PMVHavenIE(InfoExtractor):
             "tags": tags,
             "age_limit": 18,
         }
+
+
+def _media_url(info):
+    """Return a real media URL, never a relative tag/query link.
+
+    PMVHaven has occasionally published ``url`` as a relative navigation link
+    such as ``?tag=...``. Passing that value to yt-dlp makes the generic
+    extractor request the tag URL and commonly results in an opaque 403.
+    JSON-LD may expose the actual stream under ``contentUrl`` or ``video``.
+    Only absolute HTTP(S) URLs are accepted here.
+    """
+    candidates = []
+    for key in ("contentUrl", "url", "video", "embedUrl"):
+        value = info.get(key) if isinstance(info, dict) else None
+        if isinstance(value, dict):
+            value = value.get("contentUrl") or value.get("url")
+        if isinstance(value, str):
+            candidates.append(value)
+
+    for candidate in candidates:
+        media_url = url_or_none(candidate)
+        if media_url and media_url.startswith(("http://", "https://")):
+            return media_url
+    return None
 
 
 def _page_tags(extractor, webpage, info):

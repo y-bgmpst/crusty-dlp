@@ -1,5 +1,7 @@
 """Independent yt-dlp extractor for public BoyfriendTV video pages."""
 
+from urllib.parse import parse_qs, unquote, urlsplit
+
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import clean_html, determine_ext, js_to_json, url_or_none
 
@@ -10,7 +12,8 @@ class BoyfriendTVIE(InfoExtractor):
 
     def _real_extract(self, url):
         video_id = self._match_id(url)
-        slug = url.rstrip("/").rsplit("/", 1)[-1]
+        parsed_url = urlsplit(url)
+        slug = parsed_url.path.rstrip("/").rsplit("/", 1)[-1] or video_id
         canonical_url = f"https://www.boyfriendtv.com/videos/{video_id}/{slug}/"
         webpage = self._download_webpage(canonical_url, video_id, impersonate=True)
         sources = self._search_json(
@@ -68,9 +71,22 @@ class BoyfriendTVIE(InfoExtractor):
                 r"<h1[^>]*>(.+?)</h1>", webpage, "title", default=video_id
             )
         )
+        tags = _query_tags(parsed_url.query)
         return {
             "id": video_id,
             "title": title,
             "formats": formats,
+            "tags": tags,
             "age_limit": 18,
         }
+
+
+def _query_tags(query):
+    """Extract the site's tag filter without treating it as part of the URL path."""
+    values = parse_qs(query, keep_blank_values=False).get("tag", [])
+    tags = []
+    for value in values:
+        for tag in unquote(value).split():
+            if tag and tag.casefold() not in {item.casefold() for item in tags}:
+                tags.append(tag)
+    return tags
