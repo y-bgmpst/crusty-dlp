@@ -17,7 +17,7 @@ use crate::{app::DownloadMode, urls};
 
 const PROGRESS_PREFIX: &str = "crusty-dlp:";
 const MAX_PLAYLIST_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
-const MAX_PLAYLIST_ENTRIES: usize = 5_000;
+pub const MAX_PLAYLIST_ENTRIES: usize = 5_000;
 const MAX_IMPERSONATION_OUTPUT_BYTES: u64 = 512 * 1024;
 const IMPERSONATION_TIMEOUT: Duration = Duration::from_secs(8);
 

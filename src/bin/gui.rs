@@ -22,7 +22,7 @@ use crusty_dlp::{
         expand_playlist_urls, playlist_title, resolve_network_tuning, resolved_plugin_directory,
         sanitize_filename_component, supports_playlist_expansion, validate_output_template,
         validate_rate_limit, validate_retry_count, validate_socket_timeout, DownloadEvent,
-        DownloadOptions, Downloader, PlaylistEntry,
+        DownloadOptions, Downloader, PlaylistEntry, MAX_PLAYLIST_ENTRIES,
     },
     redaction::{display_url, redact_message},
     search::{open_platform_search, SearchPlatform},
@@ -1118,6 +1118,20 @@ impl GuiApp {
             self.pending_playlists.remove(&event.url);
             match event.result {
                 Ok(Some(entries)) if !entries.is_empty() => {
+                    if entries.len() > MAX_PLAYLIST_ENTRIES {
+                        let message = format!(
+                            "playlist expansion exceeded the {MAX_PLAYLIST_ENTRIES} entry limit"
+                        );
+                        self.log(format!(
+                            "Playlist expansion failed: {message} for {}",
+                            display_url(&event.url, self.config.show_sensitive_urls)
+                        ));
+                        self.status = redact_message(
+                            &message,
+                            self.config.show_sensitive_urls || cfg!(debug_assertions),
+                        );
+                        continue;
+                    }
                     let mut count = 0;
                     let folder = playlist_folder_name(&event.url, event.playlist_title.as_deref());
                     for entry in &entries {
