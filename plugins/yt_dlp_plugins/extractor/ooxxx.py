@@ -38,6 +38,8 @@ _CYRILLIC_LOOKALIKES = str.maketrans({
     "х": "x",
 })
 
+OOXXX_BASE_URL = "https://ooxxx.com"
+
 
 def _decode_video_url(value: str) -> str | None:
     normalized = value.translate(_CYRILLIC_LOOKALIKES)
@@ -76,7 +78,7 @@ class OoxxxEmbedIE(InfoExtractor):
         match = self._match_valid_url(url)
         assert match is not None
         video_id, query = match.group("id", "query")
-        canonical_url = f"https://ooxxx.com/embed/{video_id}/"
+        canonical_url = f"{OOXXX_BASE_URL}/embed/{video_id}/"
         if query:
             canonical_url = f"{canonical_url}?{query}"
 
@@ -87,7 +89,7 @@ class OoxxxEmbedIE(InfoExtractor):
             "canonical url",
             default=canonical_url,
         ))
-        api_url = f"https://ooxxx.com/api/videofile.php?video_id={video_id}"
+        api_url = f"{OOXXX_BASE_URL}/api/videofile.php?video_id={video_id}"
         payload = cast(object, self._download_json(
             api_url,
             video_id,
@@ -102,7 +104,7 @@ class OoxxxEmbedIE(InfoExtractor):
         )
         encoded_url = stream.get("video_url")
         decoded_url = _decode_video_url(encoded_url) if isinstance(encoded_url, str) else None
-        media_url = url_or_none(decoded_url and f"https://ooxxx.com{decoded_url}")
+        media_url = url_or_none(decoded_url and f"{OOXXX_BASE_URL}{decoded_url}")
         if not media_url:
             raise self.raise_no_formats("No media URL was returned by the player API")
 
