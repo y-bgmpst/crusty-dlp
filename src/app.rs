@@ -522,10 +522,11 @@ impl App {
         self.clamp_queue_offset();
         self.cancel_txs.remove(&id);
         self.set_message(message);
-        if self
-            .queue
-            .iter()
-            .any(|item| item.state == DownloadState::Waiting)
+        if state != DownloadState::Cancelled
+            && self
+                .queue
+                .iter()
+                .any(|item| item.state == DownloadState::Waiting)
         {
             self.start_requested = true;
         }
@@ -694,5 +695,32 @@ mod tests {
         assert_eq!(options.socket_timeout, Some(60));
         assert_eq!(options.retries, Some(10));
         assert_eq!(options.fragment_retries, Some(10));
+    }
+
+    #[test]
+    fn cancelled_download_does_not_auto_restart_waiting_items() {
+        let mut app = App::new(
+            Config::default(),
+            "config.toml".into(),
+            false,
+            false,
+            Vec::new(),
+            false,
+        );
+        app.queue.push_back(QueueItem {
+            id: 1,
+            url: "https://example.com/finished".into(),
+            state: DownloadState::Waiting,
+        });
+        let (id, _cancel_rx) = app.begin_download(QueueItem {
+            id: 2,
+            url: "https://example.com/active".into(),
+            state: DownloadState::Waiting,
+        });
+
+        app.handle_download_event(id, DownloadEvent::Cancelled);
+
+        assert_eq!(app.queue.back().unwrap().state, DownloadState::Cancelled);
+        assert!(!app.take_start_request());
     }
 }
