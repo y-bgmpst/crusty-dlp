@@ -1,6 +1,6 @@
 """Independent yt-dlp extractor for public BoyfriendTV video pages."""
 
-from urllib.parse import parse_qs, unquote, urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import clean_html, determine_ext, js_to_json, url_or_none
@@ -85,8 +85,11 @@ def _query_tags(query):
     """Extract the site's tag filter without treating it as part of the URL path."""
     values = parse_qs(query, keep_blank_values=False).get("tag", [])
     tags = []
+    seen = set()
     for value in values:
-        for tag in unquote(value).split():
-            if tag and tag.casefold() not in {item.casefold() for item in tags}:
+        for tag in value.split():
+            normalized = tag.casefold()
+            if tag and normalized not in seen:
+                seen.add(normalized)
                 tags.append(tag)
     return tags
