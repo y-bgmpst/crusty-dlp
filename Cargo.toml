@@ -25,6 +25,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 url = "2.5"
 urlencoding = "2.1"
 webbrowser = "1.0"
+tempfile = "3.15"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
@@ -38,7 +39,6 @@ name = "crusty-dlp-gui"
 path = "src/bin/gui.rs"
 
 [dev-dependencies]
-tempfile = "3.15"
 
 [profile.release]
 codegen-units = 1

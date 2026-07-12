@@ -13,12 +13,13 @@ use std::{
 };
 
 use arboard::Clipboard;
+use clap::Parser;
 use crusty_dlp::{
     app::{validate_url, DownloadMode, DownloadState},
     config::{normalize_output_dir, validate_output_dir, Config},
     downloader::{
         available_impersonation_targets, current_executable_path, dependency_path,
-        expand_playlist_urls, playlist_title, resolve_network_tuning, resolved_plugin_directory,
+        expand_playlist_urls, resolve_network_tuning, resolved_plugin_directory,
         sanitize_filename_component, supports_playlist_expansion, validate_output_template,
         validate_rate_limit, validate_retry_count, validate_socket_timeout, DownloadEvent,
         DownloadOptions, Downloader, PlaylistEntry,
@@ -100,6 +101,7 @@ impl GuiTheme {
 }
 
 fn main() -> eframe::Result {
+    let cli = GuiCli::parse();
     let app_title = format!("crusty-dlp v{APP_VERSION}");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -113,8 +115,16 @@ fn main() -> eframe::Result {
     eframe::run_native(
         &app_title,
         options,
-        Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, cli.urls.clone())))),
     )
+}
+
+#[derive(Debug, Parser)]
+#[command(version, about = "Start crusty-dlp GUI")]
+struct GuiCli {
+    /// Optional URLs to prefill the queue at startup
+    #[arg(value_name = "URL")]
+    urls: Vec<String>,
 }
 
 fn build_label() -> String {
@@ -282,8 +292,8 @@ struct GuiApp {
     queue_layout_dirty: bool,
     queue_running: bool,
     active_downloads: HashMap<u64, oneshot::Sender<()>>,
-    event_rx: mpsc::UnboundedReceiver<JobEvent>,
-    download_request_tx: mpsc::UnboundedSender<DownloadRequest>,
+    event_rx: mpsc::Receiver<JobEvent>,
+    download_request_tx: mpsc::Sender<DownloadRequest>,
     impersonation_targets: Vec<String>,
     logs: VecDeque<LogEntry>,
     status: String,
@@ -317,7 +327,7 @@ struct LogEntry {
 }
 
 impl GuiApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, startup_urls: Vec<String>) -> Self {
         let config_path = Config::path().ok();
         let (config, config_load_error) = match config_path.as_deref() {
             Some(path) => match Config::load(path) {
@@ -341,9 +351,8 @@ impl GuiApp {
             .as_deref()
             .map(available_impersonation_targets)
             .unwrap_or_default();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (download_request_tx, mut download_request_rx) =
-            mpsc::unbounded_channel::<DownloadRequest>();
+        let (event_tx, event_rx) = mpsc::channel(512);
+        let (download_request_tx, mut download_request_rx) = mpsc::channel::<DownloadRequest>(64);
         let (thumbnail_tx, thumbnail_rx) = std_mpsc::channel();
         let (thumbnail_request_tx, thumbnail_request_rx) = std_mpsc::channel::<ThumbnailRequest>();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
@@ -381,10 +390,9 @@ impl GuiApp {
         std::thread::spawn(move || {
             while let Ok(request) = playlist_request_rx.recv() {
                 let result = expand_playlist_urls(&request.executable, &request.url);
-                let title = playlist_title(&request.executable, &request.url);
                 let _ = playlist_tx.send(PlaylistExpansionEvent {
                     url: request.url,
-                    playlist_title: title,
+                    playlist_title: None,
                     result,
                 });
             }
@@ -401,13 +409,23 @@ impl GuiApp {
                 while let Some(request) = download_request_rx.recv().await {
                     let event_tx = worker_event_tx.clone();
                     tokio::spawn(async move {
-                        let (download_tx, mut download_rx) = mpsc::unbounded_channel();
+                        let (download_tx, mut download_rx) = mpsc::channel(256);
                         let forward = tokio::spawn(async move {
                             while let Some(event) = download_rx.recv().await {
-                                let _ = event_tx.send(JobEvent {
+                                let is_progress = matches!(event, DownloadEvent::Progress { .. });
+                                let message = JobEvent {
                                     id: request.id,
                                     event,
-                                });
+                                };
+                                match event_tx.try_send(message) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(message)) => {
+                                        if !is_progress {
+                                            let _ = event_tx.send(message).await;
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
                             }
                         });
                         request
@@ -467,7 +485,31 @@ impl GuiApp {
             diagnostics_refresh_pending: false,
         };
         app.request_diagnostics_refresh(diagnostics_tx);
+        app.add_startup_urls(startup_urls);
         app
+    }
+
+    fn add_startup_urls(&mut self, urls: Vec<String>) {
+        if urls.is_empty() {
+            return;
+        }
+        let mut added = 0usize;
+        let pending_before = self.pending_playlists.len();
+        for url in urls {
+            match self.expand_or_enqueue(&url) {
+                Ok(count) => added += count,
+                Err(error) => {
+                    self.log_level(LogLevel::Warning, format!("Rejected startup URL: {error}"))
+                }
+            }
+        }
+        if added > 0 {
+            self.status = format!("Added {added} startup item(s) to the queue");
+        } else if self.pending_playlists.len() > pending_before {
+            self.status = "Inspecting startup playlist(s) in the background…".into();
+        } else {
+            self.status = "No valid startup URLs were added".into();
+        }
     }
 
     fn save_config(&mut self) {
@@ -926,7 +968,7 @@ impl GuiApp {
 
         if self
             .download_request_tx
-            .send(DownloadRequest {
+            .try_send(DownloadRequest {
                 id,
                 downloader,
                 args,
@@ -935,7 +977,7 @@ impl GuiApp {
             .is_err()
         {
             self.active_downloads.remove(&id);
-            self.fail(index, "download worker is unavailable");
+            self.fail(index, "download worker is busy");
             return false;
         }
         true
@@ -1144,7 +1186,7 @@ impl GuiApp {
                 continue;
             };
             let texture = ctx.load_texture(
-                format!("queue-thumb-{index}"),
+                format!("queue-thumb-{}", self.queue[index].id),
                 egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba),
                 egui::TextureOptions::LINEAR,
             );
@@ -2986,8 +3028,14 @@ fn persist_thumbnail_cache(
 }
 
 fn decode_thumbnail_from_path(path: &std::path::Path) -> Result<DecodedThumbnail, String> {
-    let image = ImageReader::open(path)
-        .map_err(|error| format!("thumbnail cache open failed: {error}"))?
+    let mut reader =
+        ImageReader::open(path).map_err(|error| format!("thumbnail cache open failed: {error}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
         .decode()
         .map_err(|error| format!("thumbnail cache decode failed: {error}"))?
         .to_rgba8();

@@ -4,6 +4,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::{Command as StdCommand, Stdio},
+    time::{Duration, Instant},
 };
 
 use tokio::{
@@ -16,6 +17,9 @@ use crate::app::DownloadMode;
 
 const PROGRESS_PREFIX: &str = "crusty-dlp:";
 const MAX_PLAYLIST_OUTPUT_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PLAYLIST_ENTRIES: usize = 5_000;
+const MAX_IMPERSONATION_OUTPUT_BYTES: u64 = 512 * 1024;
+const IMPERSONATION_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Debug)]
 pub enum DownloadEvent {
@@ -221,7 +225,7 @@ impl Downloader {
         self,
         args: Vec<OsString>,
         mut cancel: oneshot::Receiver<()>,
-        tx: mpsc::UnboundedSender<DownloadEvent>,
+        tx: mpsc::Sender<DownloadEvent>,
     ) {
         let mut command = TokioCommand::new(&self.executable);
         command
@@ -236,9 +240,11 @@ impl Downloader {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                let _ = tx.send(DownloadEvent::Failed(format!(
-                    "could not start yt-dlp: {error}"
-                )));
+                let _ = tx
+                    .send(DownloadEvent::Failed(format!(
+                        "could not start yt-dlp: {error}"
+                    )))
+                    .await;
                 return;
             }
         };
@@ -250,7 +256,7 @@ impl Downloader {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 if let Some(event) = parse_progress(&line) {
-                    let _ = progress_tx.send(event);
+                    let _ = progress_tx.try_send(event);
                 }
             }
         });
@@ -273,16 +279,16 @@ impl Downloader {
                 let _ = stdout_task.await;
                 let error = error_task.await.unwrap_or_default();
                 match status {
-                    Ok(status) if status.success() => { let _ = tx.send(DownloadEvent::Finished); }
-                    Ok(status) => { let _ = tx.send(DownloadEvent::Failed(if error.is_empty() { format!("yt-dlp exited with {status}") } else { error })); }
-                    Err(error) => { let _ = tx.send(DownloadEvent::Failed(format!("could not wait for yt-dlp: {error}"))); }
+                    Ok(status) if status.success() => { let _ = tx.send(DownloadEvent::Finished).await; }
+                    Ok(status) => { let _ = tx.send(DownloadEvent::Failed(if error.is_empty() { format!("yt-dlp exited with {status}") } else { error })).await; }
+                    Err(error) => { let _ = tx.send(DownloadEvent::Failed(format!("could not wait for yt-dlp: {error}"))).await; }
                 }
             }
             _ = &mut cancel => {
                 terminate_process_tree(&mut child).await;
                 stdout_task.abort();
                 error_task.abort();
-                let _ = tx.send(DownloadEvent::Cancelled);
+                let _ = tx.send(DownloadEvent::Cancelled).await;
             }
         }
     }
@@ -331,6 +337,14 @@ fn bounded_command_output(
     command: &mut StdCommand,
     limit: u64,
 ) -> Result<std::process::Output, String> {
+    bounded_command_output_with_timeout(command, limit, None)
+}
+
+fn bounded_command_output_with_timeout(
+    command: &mut StdCommand,
+    limit: u64,
+    timeout: Option<Duration>,
+) -> Result<std::process::Output, String> {
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -344,31 +358,38 @@ fn bounded_command_output(
         .stderr
         .take()
         .ok_or_else(|| "could not capture command stderr".to_owned())?;
-    let stdout_limit = limit.saturating_add(1);
-    let stdout_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stdout
-            .take(stdout_limit)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let stderr_thread = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        stderr
-            .take(stdout_limit)
-            .read_to_end(&mut bytes)
-            .map(|_| bytes)
-    });
-    let status = child.wait().map_err(|error| error.to_string())?;
-    let stdout = stdout_thread
+    let stdout_limit = limit.saturating_add(1) as usize;
+    let stdout_thread = std::thread::spawn(move || read_limited_and_drain(stdout, stdout_limit));
+    let stderr_thread = std::thread::spawn(move || read_limited_and_drain(stderr, stdout_limit));
+    let status = if let Some(timeout) = timeout {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(status) = child.try_wait().map_err(|error| error.to_string())? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("command timed out after {}s", timeout.as_secs()));
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    } else {
+        child.wait().map_err(|error| error.to_string())?
+    };
+    let (stdout, stdout_truncated) = stdout_thread
         .join()
         .map_err(|_| "stdout reader thread panicked".to_owned())?
         .map_err(|error| error.to_string())?;
-    let stderr = stderr_thread
+    let (stderr, stderr_truncated) = stderr_thread
         .join()
         .map_err(|_| "stderr reader thread panicked".to_owned())?
         .map_err(|error| error.to_string())?;
-    if stdout.len() as u64 > limit || stderr.len() as u64 > limit {
+    if stdout_truncated
+        || stderr_truncated
+        || stdout.len() as u64 > limit
+        || stderr.len() as u64 > limit
+    {
         return Err(format!("command output exceeds the {limit} byte limit"));
     }
     Ok(std::process::Output {
@@ -376,6 +397,32 @@ fn bounded_command_output(
         stdout,
         stderr,
     })
+}
+
+fn read_limited_and_drain<R: Read>(
+    mut reader: R,
+    limit_plus_one: usize,
+) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut bytes = Vec::with_capacity(limit_plus_one.min(8192));
+    let mut truncated = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        if bytes.len() < limit_plus_one {
+            let remaining = limit_plus_one - bytes.len();
+            let keep = remaining.min(read);
+            bytes.extend_from_slice(&buffer[..keep]);
+            if keep < read {
+                truncated = true;
+            }
+        } else {
+            truncated = true;
+        }
+    }
+    Ok((bytes, truncated))
 }
 
 #[cfg(unix)]
@@ -430,10 +477,13 @@ pub fn current_executable_path() -> Option<PathBuf> {
 /// Ask yt-dlp itself which impersonation targets are usable. This avoids
 /// assuming that an installed Python package is visible to every yt-dlp build.
 pub fn available_impersonation_targets(executable: &Path) -> Vec<String> {
-    let Ok(output) = StdCommand::new(executable)
-        .arg("--list-impersonate-targets")
-        .output()
-    else {
+    let mut command = StdCommand::new(executable);
+    command.arg("--list-impersonate-targets");
+    let Ok(output) = bounded_command_output_with_timeout(
+        &mut command,
+        MAX_IMPERSONATION_OUTPUT_BYTES,
+        Some(IMPERSONATION_TIMEOUT),
+    ) else {
         return Vec::new();
     };
     if !output.status.success() {
@@ -534,12 +584,18 @@ pub fn expand_playlist_urls(
     }
 
     let source = playlist_source(url);
-    let entries = dedupe_playlist_entries(
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter_map(|line| parse_flat_playlist_line(line, source))
-            .collect::<Vec<_>>(),
-    );
+    let mut parsed_entries = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        if let Some(entry) = parse_flat_playlist_line(line, source) {
+            parsed_entries.push(entry);
+            if parsed_entries.len() > MAX_PLAYLIST_ENTRIES {
+                return Err(format!(
+                    "playlist inspection exceeded the {MAX_PLAYLIST_ENTRIES} entry limit for {url}"
+                ));
+            }
+        }
+    }
+    let entries = dedupe_playlist_entries(parsed_entries);
     if entries.is_empty() {
         return Err(format!("playlist inspection found 0 entries for {url}"));
     }
@@ -657,12 +713,18 @@ fn expand_pmvhaven_playlist_urls(
         .map_err(|error| format!("could not inspect PMVHaven playlist: {error}"))?;
     let mut yt_dlp_error = None;
     let entries = if output.status.success() {
-        dedupe_playlist_entries(
-            String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| parse_flat_playlist_line(line, PlaylistSource::PmvHaven))
-                .collect::<Vec<_>>(),
-        )
+        let mut parsed_entries = Vec::new();
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(entry) = parse_flat_playlist_line(line, PlaylistSource::PmvHaven) {
+                parsed_entries.push(entry);
+                if parsed_entries.len() > MAX_PLAYLIST_ENTRIES {
+                    return Err(format!(
+                        "playlist inspection exceeded the {MAX_PLAYLIST_ENTRIES} entry limit for {canonical_url}"
+                    ));
+                }
+            }
+        }
+        dedupe_playlist_entries(parsed_entries)
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr);
         yt_dlp_error = Some(

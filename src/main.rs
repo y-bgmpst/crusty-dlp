@@ -96,7 +96,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (download_tx, mut download_rx) = mpsc::unbounded_channel();
+    let (download_tx, mut download_rx) = mpsc::channel(256);
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
         tokio::select! {
@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn start_next(app: &mut App, tx: mpsc::UnboundedSender<DownloadEvent>) {
+async fn start_next(app: &mut App, tx: mpsc::Sender<DownloadEvent>) {
     let Some(item) = app.next_queued() else {
         app.message = "Queue is empty".into();
         return;
