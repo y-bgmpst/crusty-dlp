@@ -39,22 +39,68 @@ downloads without bypassing DRM or access controls.
 - Cancellation must terminate the complete process tree and leave no orphaned
   `yt-dlp`, `ffmpeg`, or `aria2c` processes.
 
-## Agent tooling and permissions (updated)
+## Agent tooling and permissions (policy-driven)
 
-- Any automated agent must list the tools it intends to use and request explicit permission before using network-capable tools or system-level commands that can modify the host system (for example: `sudo`, package managers that install system packages, or any command that changes CI/workflows or system configuration).
-- Allowed without prior permission (subject to the constraints below):
-  - Git read operations: `clone`, `fetch`, `log`, `status`, `diff`. Local git operations inside the repository (creating branches, local commits) are allowed for drafting; pushing, opening PRs, or modifying remote branches still require explicit human authorization.
-  - NodeJS tooling limited to the project: running `npx`, executing project-local npm scripts, and installing packages locally within the repository (e.g., `npm ci`, `npm install` into the project workspace) — provided a lockfile (`package-lock.json` / `yarn.lock` / `pnpm-lock.yaml`) is present and used.
-  - Rust tooling limited to the project: `cargo build`, `cargo check`, `cargo test`, and other local cargo commands that operate on the repository.
-- Additional safety constraints for allowed operations:
-  - No global/system package installs (no `-g`, no system-wide npm/pip installs) and no modification of system PATH or system package databases without explicit permission.
-  - Prefer lockfile-driven installs (`npm ci`, `cargo build --locked`), offline caches, and verified registries. If a lockfile is missing or network use would fetch unverified code, the agent must request permission.
-  - Disallow running package-install lifecycle scripts or arbitrary remote install-and-execute steps unless explicitly authorized; prefer `--ignore-scripts` or other mitigations when feasible.
-  - Any network fetch that brings external code or binaries into the repo must include integrity verification (lockfile, checksum, or signature) and must be reported in the preflight tool list.
-- Explicit-permission actions (must ask before proceeding):
-  - Any command requiring elevated privileges (`sudo`, package managers that modify system packages like `pacman`, `apt`, `dnf`, `zypper`), publishing packages to external registries, adding system services, or changing CI/workflow files or secrets.
-  - Any operation that will publish or distribute artifacts (e.g., `npm publish`, `cargo publish`, uploading releases) or modify remote repositories (push/merge) without prior maintainer approval.
-- Reporting requirement: The agent's preflight tool list must clearly name intended commands (e.g., `git clone`, `npm ci`, `cargo build`), why they are needed, whether they access the network, and what files/configs (lockfiles, build scripts) they rely on.
+Statt wiederholter Einzelgenehmigungen wird ein repository‑lokales Policy‑Dokument verwendet: `.agent-policy.yaml`. Dieses Dokument definiert vertrauenswürdige Agenten, erlaubte Toolklassen und zulässige Branch‑Muster. Agents, die in der Policy gelistet sind und ein gültiges Preflight‑Manifest vorlegen, dürfen bestimmte, im Policy‑Scope definierte Aktionen ohne weitere interaktive Bestätigung durchführen.
+
+Kurzfassung der Regeln
+
+- Policy‑Datei: `.agent-policy.yaml` im Repo (von Maintainer:innen verwaltet). Sie listet vertrauenswürdige Agenten (ID, Name, public_key), erlaubte Aktionen (z. B. `git_read`, `cargo_build`, `node_local_install`) und erlaubte Branchmuster (z. B. `agent/*`).
+- Vorgelegte Manifeste: Jeder Agent muss vor Ausführung ein Preflight‑Manifest (Tools, Versionen, Zweck, Timestamp) vorlegen. Das Manifest muss signiert sein und wird gegen `.agent-policy.yaml` validiert.
+- Erlaubte, nicht-interaktive Aktionen (wenn durch Policy abgedeckt):
+  - Git‑Leseoperationen: `clone`, `fetch`, `log`, `status`, `diff`.
+  - Lokale Builds/Tests innerhalb des Repos: `cargo build`, `cargo check`, `cargo test`, `npm ci` (nur mit Lockfile).
+  - Pushes in erlaubte Namensräume, z. B. `agent/*` (nur wenn explizit in der Policy erlaubt).
+- Immer genehmigungspflichtig (müssen menschlich freigegeben werden):
+  - Pushes auf geschützte Branches (`main`, `release`, `packaging/*`) oder Änderungen an CI/Workflows/Secrets.
+  - Veröffentlichung/Publish (z. B. `npm publish`, `cargo publish`).
+  - Befehle mit erhöhten Rechten (`sudo`) oder Änderungen an Systempaketen/Hostkonfiguration.
+- Audit & Revocation:
+  - Alle Agent‑Aktionen werden in einem Audit‑Log dokumentiert (wer, was, wann, Manifest). Policy‑Einträge haben Ablaufdaten (TTL) und können jederzeit per Commit/PR entzogen werden.
+
+Praktische Umsetzungsempfehlungen
+
+- Beginne mit einer kleinen Policy, die nur vertrauenswürdige Agents und das Branch‑Pattern `agent/*` enthält. Erlaube diesen Agents pushes in `agent/*`; humans reviewen PRs gegen `main`.
+- Validierung: Agent‑Runner oder Integration prüft Preflight‑Manifest und Signatur vor Ausführung.
+- Branch‑Protection: Konfiguriere Branch Protection Rules für `main`/`release` so, dass nur gemergte PRs Änderungen vornehmen können.
+
+Beispiel‑Policy (Beispiel, anpassbar):
+
+```yaml
+version: 1
+trusted_agents:
+  - id: "build-bot"
+    name: "build-bot@ci"
+    public_key: "ssh-ed25519 AAAA..."
+    allowed:
+      - git_read
+      - cargo_build
+      - cargo_check
+    allowed_branches:
+      - "agent/*"
+    expires: "2026-12-31T23:59:59Z"
+
+  - id: "npm-helper"
+    name: "npm-helper@runner"
+    public_key: "ssh-ed25519 AAAA..."
+    allowed:
+      - git_read
+      - node_local_install   # only with lockfile
+    allowed_branches:
+      - "agent/*"
+    restrictions:
+      require_lockfile: true
+    expires: "2026-12-31T23:59:59Z"
+
+global_rules:
+  require_signed_preflight: true
+  audit_log_path: "audit/agent-actions.log"
+  protected_branches:
+    - "main"
+    - "release"
+```
+
+Diese Policy reduziert wiederholte Bestätigungen, behält aber Kontrolle über risikoreiche Aktionen und liefert Audit‑Nachweise.
 
 ## Error handling
 

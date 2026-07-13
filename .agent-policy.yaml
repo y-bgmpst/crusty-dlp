@@ -1,0 +1,31 @@
+version: 1
+trusted_agents:
+  - id: "build-bot"
+    name: "build-bot@ci"
+    public_key: "ssh-ed25519 AAAA..."
+    allowed:
+      - git_read
+      - cargo_build
+      - cargo_check
+    allowed_branches:
+      - "agent/*"
+    expires: "2026-12-31T23:59:59Z"
+
+  - id: "npm-helper"
+    name: "npm-helper@runner"
+    public_key: "ssh-ed25519 AAAA..."
+    allowed:
+      - git_read
+      - node_local_install
+    allowed_branches:
+      - "agent/*"
+    restrictions:
+      require_lockfile: true
+    expires: "2026-12-31T23:59:59Z"
+
+global_rules:
+  require_signed_preflight: true
+  audit_log_path: "audit/agent-actions.log"
+  protected_branches:
+    - "main"
+    - "release"
