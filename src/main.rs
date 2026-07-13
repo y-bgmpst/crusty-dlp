@@ -112,7 +112,12 @@ async fn main() -> Result<()> {
         if app.take_start_request() {
             while app.active_downloads() < app.max_active_downloads() {
                 let started = start_next(&mut app, download_tx.clone()).await;
-                if !started && !app.queue.iter().any(|item| item.state == crusty_dlp::app::DownloadState::Waiting) {
+                if !started
+                    && !app
+                        .queue
+                        .iter()
+                        .any(|item| item.state == crusty_dlp::app::DownloadState::Waiting)
+                {
                     break;
                 }
             }
