@@ -57,6 +57,27 @@ class ArchiveTests(unittest.TestCase):
             self.assertIn("[REDACTED]", requests[1][2]["children"][0]["paragraph"]["rich_text"][0]["text"]["content"])
         os.environ.pop("CODEX_BRIDGE_ARCHIVE_DIR", None)
 
+    def test_consult_gemini_archiving(self):
+        from unittest.mock import patch, MagicMock
+        with tempfile.TemporaryDirectory() as directory:
+            os.environ["CODEX_BRIDGE_ARCHIVE_DIR"] = directory
+            with patch("shutil.which", return_value="/mock/agy"), \
+                 patch("subprocess.run") as mock_run:
+                mock_run.return_value = MagicMock(returncode=0, stdout="Mock Gemini Output", stderr="")
+                from server import consult_gemini
+                response = consult_gemini("hi", directory)
+                self.assertEqual(response, "Mock Gemini Output")
+                mock_run.assert_called_once_with(
+                    ["/mock/agy", "--print", "hi"],
+                    cwd=directory,
+                    capture_output=True,
+                    text=True,
+                    timeout=90,
+                    shell=False,
+                )
+        os.environ.pop("CODEX_BRIDGE_ARCHIVE_DIR", None)
+
+
 
 if __name__ == "__main__":
     unittest.main()

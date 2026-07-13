@@ -57,12 +57,12 @@ def _safe_name(value: str, fallback: str) -> str:
 
 class ArchiveStore:
     def __init__(self) -> None:
-        configured = os.environ.get("CODEX_BRIDGE_ARCHIVE_DIR")
+        configured = os.environ.get("AGY_BRIDGE_ARCHIVE_DIR") or os.environ.get("CODEX_BRIDGE_ARCHIVE_DIR")
         self.root = Path(configured).expanduser() if configured else (
-            Path.home() / ".local" / "share" / "codex-bridge" / "projects"
+            Path.home() / ".local" / "share" / "agy-bridge" / "projects"
         )
-        self.default_project = os.environ.get("CODEX_BRIDGE_PROJECT", "Codex Bridge")
-        self.default_session = os.environ.get("CODEX_BRIDGE_SESSION_ID", str(uuid.uuid4()))
+        self.default_project = os.environ.get("AGY_BRIDGE_PROJECT") or os.environ.get("CODEX_BRIDGE_PROJECT", "Agy Bridge")
+        self.default_session = os.environ.get("AGY_BRIDGE_SESSION_ID") or os.environ.get("CODEX_BRIDGE_SESSION_ID", str(uuid.uuid4()))
         self.lock = threading.RLock()
 
     def _project_dir(self, project: str) -> Path:
@@ -309,6 +309,28 @@ def consult_codex(query: str, directory: str, format: str = "text", timeout: int
         shell=False,
     )
     response = result.stdout if result.returncode == 0 else f"Codex CLI Error: {result.stderr.strip()}"
+    save_and_sync(response, "assistant", STORE.default_project, session)
+    return response if format == "text" else json.dumps({"status": "success" if result.returncode == 0 else "error", "response": response})
+
+@mcp.tool()
+def consult_gemini(query: str, directory: str, format: str = "text", timeout: int = 90) -> str:
+    """Ask the local Gemini (agy) CLI and archive both sides of the exchange."""
+    if not Path(directory).is_dir():
+        raise ValueError(f"directory does not exist: {directory}")
+    agy = shutil.which("agy") or "/home/rhax/.local/bin/agy"
+    if not os.path.exists(agy) and not shutil.which("agy"):
+        raise RuntimeError("Agy CLI not found in PATH or standard location")
+    session = STORE.default_session
+    save_and_sync(query, "user", STORE.default_project, session)
+    result = subprocess.run(
+        [agy, "--print", query],
+        cwd=directory,
+        capture_output=True,
+        text=True,
+        timeout=max(1, min(timeout, 900)),
+        shell=False,
+    )
+    response = result.stdout if result.returncode == 0 else f"Agy CLI Error: {result.stderr.strip()}"
     save_and_sync(response, "assistant", STORE.default_project, session)
     return response if format == "text" else json.dumps({"status": "success" if result.returncode == 0 else "error", "response": response})
 
