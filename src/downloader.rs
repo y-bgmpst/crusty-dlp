@@ -966,6 +966,12 @@ pub fn validate_extractor_args(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn prepared_extractor_args(value: &str) -> Result<Option<&str>, String> {
+    let trimmed = value.trim();
+    validate_extractor_args(trimmed)?;
+    Ok((!trimmed.is_empty()).then_some(trimmed))
+}
+
 pub fn validate_socket_timeout(value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1005,6 +1011,38 @@ pub fn resolve_network_tuning(
         fragment_retries: parse_retry_count(fragment_retries, "Fragment retries")?
             .or_else(|| pmvhaven_defaults.then_some(10)),
     })
+}
+
+pub fn requires_impersonation(url: &str) -> bool {
+    is_boyfriendtv_url(url) || is_spankbang_url(url)
+}
+
+pub fn effective_impersonation_target<'a>(
+    url: &str,
+    configured_impersonation: Option<&'a str>,
+    cookies_browser: Option<&str>,
+) -> Option<&'a str> {
+    configured_impersonation
+        .filter(|target| *target != "none")
+        .or_else(|| {
+            if is_spankbang_url(url) {
+                Some(browser_impersonation_target(
+                    cookies_browser.unwrap_or("none"),
+                ))
+            } else if requires_impersonation(url) {
+                Some("any")
+            } else {
+                None
+            }
+        })
+}
+
+pub fn is_boyfriendtv_url(value: &str) -> bool {
+    url_host_matches(value, "boyfriendtv.com")
+}
+
+pub fn is_spankbang_url(value: &str) -> bool {
+    url_host_matches(value, "spankbang.com")
 }
 
 fn parse_socket_timeout(value: &str) -> Result<Option<u32>, String> {
@@ -1114,6 +1152,15 @@ fn non_empty_trimmed(value: &str) -> Option<&str> {
     (!trimmed.is_empty()).then_some(trimmed)
 }
 
+fn browser_impersonation_target(browser: &str) -> &'static str {
+    match browser {
+        "firefox" => "firefox",
+        "edge" => "edge",
+        "chrome" | "chromium" | "brave" | "vivaldi" => "chrome",
+        _ => "any",
+    }
+}
+
 fn is_youtube_playlist_url(url: &str) -> bool {
     (url_host_matches(url, "youtube.com") || url_host_matches(url, "youtu.be"))
         && (url.contains("list=") || url.contains("/playlist"))
@@ -1212,6 +1259,48 @@ mod tests {
             parse_impersonation_targets(output),
             vec!["chrome", "firefox"]
         );
+    }
+
+    #[test]
+    fn shared_impersonation_rules_match_special_hosts() {
+        assert_eq!(
+            effective_impersonation_target(
+                "https://spankbang.com/7ubnq/video/example",
+                None,
+                Some("firefox"),
+            ),
+            Some("firefox")
+        );
+        assert_eq!(
+            effective_impersonation_target(
+                "https://www.boyfriendtv.com/videos/123/example",
+                None,
+                None,
+            ),
+            Some("any")
+        );
+        assert_eq!(
+            effective_impersonation_target("https://example.com/video", Some("chrome"), None),
+            Some("chrome")
+        );
+        assert_eq!(
+            effective_impersonation_target(
+                "https://www.boyfriendtv.com/videos/123/example",
+                Some("none"),
+                None,
+            ),
+            Some("any")
+        );
+    }
+
+    #[test]
+    fn prepared_extractor_args_trim_and_validate() {
+        assert_eq!(
+            prepared_extractor_args("  youtube:player_client=default  ").unwrap(),
+            Some("youtube:player_client=default")
+        );
+        assert_eq!(prepared_extractor_args("   ").unwrap(), None);
+        assert!(prepared_extractor_args("youtube:foo=bar\nnext:bad").is_err());
     }
 
     #[test]

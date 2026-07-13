@@ -8,8 +8,9 @@ use tokio::sync::oneshot;
 use crate::{
     config::{validate_output_dir, Config},
     downloader::{
-        resolve_network_tuning, supports_playlist_expansion, validate_extractor_args,
-        validate_output_template, validate_rate_limit, DownloadEvent, DownloadOptions,
+        effective_impersonation_target, is_spankbang_url, prepared_extractor_args,
+        resolve_network_tuning, supports_playlist_expansion, validate_output_template,
+        validate_rate_limit, DownloadEvent, DownloadOptions,
     },
     errors::AppError,
     redaction::{display_url, redact_message},
@@ -327,27 +328,21 @@ impl App {
     }
 
     pub fn requires_impersonation(&self, url: &str) -> bool {
-        is_boyfriendtv_url(url) || is_spankbang_url(url)
+        crate::downloader::requires_impersonation(url)
     }
 
     pub fn effective_impersonation<'a>(&'a self, url: &str) -> Option<&'a str> {
-        match self.config.impersonation.as_str() {
-            "none" if is_spankbang_url(url) => match self.config.cookies_browser.as_str() {
-                "firefox" => Some("firefox"),
-                "edge" => Some("edge"),
-                "chrome" | "chromium" | "brave" | "vivaldi" => Some("chrome"),
-                _ => Some("any"),
-            },
-            "none" if self.requires_impersonation(url) => Some("any"),
-            "none" => None,
-            target => Some(target),
-        }
+        effective_impersonation_target(
+            url,
+            (self.config.impersonation != "none").then_some(self.config.impersonation.as_str()),
+            (self.config.cookies_browser != "none").then_some(self.config.cookies_browser.as_str()),
+        )
     }
 
     pub fn download_options<'a>(&'a self, url: &str) -> Result<DownloadOptions<'a>, String> {
         validate_output_template(&self.config.output_template)?;
         validate_rate_limit(&self.config.rate_limit)?;
-        validate_extractor_args(&self.config.extractor_args)?;
+        let extractor_args = prepared_extractor_args(&self.config.extractor_args)?;
         let tuning = resolve_network_tuning(
             url,
             &self.config.socket_timeout,
@@ -368,8 +363,7 @@ impl App {
             socket_timeout: tuning.socket_timeout,
             retries: tuning.retries,
             fragment_retries: tuning.fragment_retries,
-            extractor_args: (!self.config.extractor_args.trim().is_empty())
-                .then_some(self.config.extractor_args.trim()),
+            extractor_args,
             playlist_subfolder: None,
             playlist_subfolders: self.config.playlist_subfolders
                 && supports_playlist_expansion(url),
@@ -568,33 +562,10 @@ pub fn validate_url(value: &str) -> Result<(), AppError> {
     }
 }
 
-pub fn is_boyfriendtv_url(value: &str) -> bool {
-    url_host_matches(value, "boyfriendtv.com")
-}
-
-pub fn is_spankbang_url(value: &str) -> bool {
-    url_host_matches(value, "spankbang.com")
-}
-
-fn url_host_matches(value: &str, expected: &str) -> bool {
-    let Some((_, remainder)) = value.split_once("://") else {
-        return false;
-    };
-    let authority = remainder.split(['/', '?', '#']).next().unwrap_or_default();
-    let host = authority
-        .rsplit('@')
-        .next()
-        .unwrap_or_default()
-        .split(':')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    host == expected || host.ends_with(&format!(".{expected}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::downloader::is_boyfriendtv_url;
     #[test]
     fn accepts_http_urls() {
         assert!(validate_url("https://example.com/a?b=c").is_ok());
