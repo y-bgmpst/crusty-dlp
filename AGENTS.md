@@ -39,6 +39,23 @@ downloads without bypassing DRM or access controls.
 - Cancellation must terminate the complete process tree and leave no orphaned
   `yt-dlp`, `ffmpeg`, or `aria2c` processes.
 
+## Agent tooling and permissions (updated)
+
+- Any automated agent must list the tools it intends to use and request explicit permission before using network-capable tools or system-level commands that can modify the host system (for example: `sudo`, package managers that install system packages, or any command that changes CI/workflows or system configuration).
+- Allowed without prior permission (subject to the constraints below):
+  - Git read operations: `clone`, `fetch`, `log`, `status`, `diff`. Local git operations inside the repository (creating branches, local commits) are allowed for drafting; pushing, opening PRs, or modifying remote branches still require explicit human authorization.
+  - NodeJS tooling limited to the project: running `npx`, executing project-local npm scripts, and installing packages locally within the repository (e.g., `npm ci`, `npm install` into the project workspace) — provided a lockfile (`package-lock.json` / `yarn.lock` / `pnpm-lock.yaml`) is present and used.
+  - Rust tooling limited to the project: `cargo build`, `cargo check`, `cargo test`, and other local cargo commands that operate on the repository.
+- Additional safety constraints for allowed operations:
+  - No global/system package installs (no `-g`, no system-wide npm/pip installs) and no modification of system PATH or system package databases without explicit permission.
+  - Prefer lockfile-driven installs (`npm ci`, `cargo build --locked`), offline caches, and verified registries. If a lockfile is missing or network use would fetch unverified code, the agent must request permission.
+  - Disallow running package-install lifecycle scripts or arbitrary remote install-and-execute steps unless explicitly authorized; prefer `--ignore-scripts` or other mitigations when feasible.
+  - Any network fetch that brings external code or binaries into the repo must include integrity verification (lockfile, checksum, or signature) and must be reported in the preflight tool list.
+- Explicit-permission actions (must ask before proceeding):
+  - Any command requiring elevated privileges (`sudo`, package managers that modify system packages like `pacman`, `apt`, `dnf`, `zypper`), publishing packages to external registries, adding system services, or changing CI/workflow files or secrets.
+  - Any operation that will publish or distribute artifacts (e.g., `npm publish`, `cargo publish`, uploading releases) or modify remote repositories (push/merge) without prior maintainer approval.
+- Reporting requirement: The agent's preflight tool list must clearly name intended commands (e.g., `git clone`, `npm ci`, `cargo build`), why they are needed, whether they access the network, and what files/configs (lockfiles, build scripts) they rely on.
+
 ## Error handling
 
 - Represent expected failures with `Result`/`Option` and surface clear messages
@@ -82,7 +99,7 @@ states require unit or integration tests.
 - TUI and egui/eframe GUI with queue management, parallel downloads,
   pause/resume/cancel, dry-run, and debug output.
 - Shared yt-dlp argument construction for formats, output templates,
-  rate-limits, aria2, cookies, impersonation, network retries, extractor
+  rate-limits, aria, cookies, impersonation, network retries, extractor
   arguments, and metadata.
 - Supported playlist expansion with deduplication, titles/thumbnails, and safe
   playlist subfolders.
@@ -106,3 +123,120 @@ states require unit or integration tests.
 3. Redact URLs and sensitive values in logs and debug commands.
 4. Use stable queue IDs and further virtualization for very large playlists.
 5. Expand package smoke tests for desktop files, plugin paths, and window IDs.
+
+---
+
+## Included from: https://github.com/actionbook/rust-skills/blob/main/AGENTS.md
+
+# Rust Skills - Agent Instructions
+
+> For OpenAI Codex and compatible agents
+
+## Default Project Settings
+
+When creating Rust projects or Cargo.toml files, ALWAYS use:
+
+```toml
+[package]
+edition = "2024"
+rust-version = "1.85"
+
+[lints.rust]
+unsafe_code = "warn"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
+```
+
+## Core Capabilities
+
+### 1. Question Routing
+Route Rust questions to appropriate skills:
+- Ownership/borrowing → m01-ownership
+- Smart pointers → m02-resource
+- Error handling → m06-error-handling
+- Concurrency → m07-concurrency
+- Unsafe code → unsafe-checker
+
+### 2. Code Style
+Follow Rust coding guidelines:
+- Use snake_case for variables and functions
+- Use PascalCase for types and traits
+- Use SCREAMING_SNAKE_CASE for constants
+- Max line length: 100 characters
+- Use `?` operator instead of `unwrap()` in library code
+
+### 3. Error Handling
+```rust
+// Good: Use Result with context
+fn read_config() -> Result<Config, ConfigError> {
+    let content = std::fs::read_to_string("config.toml")
+        .map_err(|e| ConfigError::Io(e))?;
+    toml::from_str(&content)
+        .map_err(|e| ConfigError::Parse(e))
+}
+
+// Avoid: unwrap() in library code
+fn read_config() -> Config {
+    let content = std::fs::read_to_string("config.toml").unwrap(); // Bad
+    toml::from_str(&content).unwrap() // Bad
+}
+```
+
+### 4. Unsafe Code
+Every `unsafe` block MUST have a `// SAFETY:` comment:
+```rust
+// SAFETY: We checked that index < len above, so this is in bounds
+unsafe { slice.get_unchecked(index) }
+```
+
+### 5. Common Error Fixes
+
+| Error | Cause | Fix |
+|-------|-------|-----|
+| E0382 | Use of moved value | Clone, borrow, or use reference |
+| E0597 | Lifetime too short | Extend lifetime or restructure |
+| E0502 | Borrow conflict | Split borrows or use RefCell |
+| E0499 | Multiple mut borrows | Restructure to single mut borrow |
+| E0277 | Missing trait impl | Add trait bound or implement trait |
+
+## Quick Reference
+
+### Ownership
+- Each value has one owner
+- Borrowing: `&T` (shared) or `&mut T` (exclusive)
+- Lifetimes: `'a` annotations for references
+
+### Smart Pointers
+- `Box<T>`: Heap allocation
+- `Rc<T>`: Reference counting (single-threaded)
+- `Arc<T>`: Atomic reference counting (thread-safe)
+- `RefCell<T>`: Interior mutability
+
+### Concurrency
+- `Send`: Safe to transfer between threads
+- `Sync`: Safe to share references between threads
+- `Mutex<T>`: Mutual exclusion
+- `RwLock<T>`: Reader-writer lock
+
+### Async
+```rust
+#[tokio::main]
+async fn main() {
+    let handle = tokio::spawn(async {
+        // async work
+    });
+    handle.await.unwrap();
+}
+```
+
+## Skill Files
+
+For detailed guidance, see:
+- `skills/rust-router/SKILL.md` - Question routing
+- `skills/coding-guidelines/SKILL.md` - Code style rules
+- `skills/unsafe-checker/SKILL.md` - Unsafe code review
+- `skills/m01-ownership/SKILL.md` - Ownership concepts
+- `skills/m06-error-handling/SKILL.md` - Error patterns
+- `skills/m07-concurrency/SKILL.md` - Concurrency patterns
