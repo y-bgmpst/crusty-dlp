@@ -13,15 +13,17 @@ use std::{
 };
 
 use arboard::Clipboard;
+use clap::Parser;
 use crusty_dlp::{
     app::{validate_url, DownloadMode, DownloadState},
     config::{normalize_output_dir, validate_output_dir, Config},
     downloader::{
         available_impersonation_targets, current_executable_path, dependency_path,
-        expand_playlist_urls, playlist_title, resolve_network_tuning, resolved_plugin_directory,
+        effective_impersonation_target, expand_playlist_urls, playlist_title,
+        prepared_extractor_args, resolve_network_tuning, resolved_plugin_directory,
         sanitize_filename_component, supports_playlist_expansion, validate_output_template,
         validate_rate_limit, validate_retry_count, validate_socket_timeout, DownloadEvent,
-        DownloadOptions, Downloader, PlaylistEntry,
+        DownloadOptions, Downloader, PlaylistEntry, MAX_PLAYLIST_ENTRIES,
     },
     redaction::{display_url, redact_message},
     search::{open_platform_search, SearchPlatform},
@@ -100,6 +102,7 @@ impl GuiTheme {
 }
 
 fn main() -> eframe::Result {
+    let cli = GuiCli::parse();
     let app_title = format!("crusty-dlp v{APP_VERSION}");
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -113,8 +116,16 @@ fn main() -> eframe::Result {
     eframe::run_native(
         &app_title,
         options,
-        Box::new(|cc| Ok(Box::new(GuiApp::new(cc)))),
+        Box::new(move |cc| Ok(Box::new(GuiApp::new(cc, cli.urls.clone())))),
     )
+}
+
+#[derive(Debug, Parser)]
+#[command(version, about = "Start crusty-dlp GUI")]
+struct GuiCli {
+    /// Optional URLs to prefill the queue at startup
+    #[arg(value_name = "URL")]
+    urls: Vec<String>,
 }
 
 fn build_label() -> String {
@@ -282,8 +293,8 @@ struct GuiApp {
     queue_layout_dirty: bool,
     queue_running: bool,
     active_downloads: HashMap<u64, oneshot::Sender<()>>,
-    event_rx: mpsc::UnboundedReceiver<JobEvent>,
-    download_request_tx: mpsc::UnboundedSender<DownloadRequest>,
+    event_rx: mpsc::Receiver<JobEvent>,
+    download_request_tx: mpsc::Sender<DownloadRequest>,
     impersonation_targets: Vec<String>,
     logs: VecDeque<LogEntry>,
     status: String,
@@ -317,7 +328,7 @@ struct LogEntry {
 }
 
 impl GuiApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(cc: &eframe::CreationContext<'_>, startup_urls: Vec<String>) -> Self {
         let config_path = Config::path().ok();
         let (config, config_load_error) = match config_path.as_deref() {
             Some(path) => match Config::load(path) {
@@ -341,9 +352,8 @@ impl GuiApp {
             .as_deref()
             .map(available_impersonation_targets)
             .unwrap_or_default();
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (download_request_tx, mut download_request_rx) =
-            mpsc::unbounded_channel::<DownloadRequest>();
+        let (event_tx, event_rx) = mpsc::channel(512);
+        let (download_request_tx, mut download_request_rx) = mpsc::channel::<DownloadRequest>(64);
         let (thumbnail_tx, thumbnail_rx) = std_mpsc::channel();
         let (thumbnail_request_tx, thumbnail_request_rx) = std_mpsc::channel::<ThumbnailRequest>();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
@@ -381,10 +391,10 @@ impl GuiApp {
         std::thread::spawn(move || {
             while let Ok(request) = playlist_request_rx.recv() {
                 let result = expand_playlist_urls(&request.executable, &request.url);
-                let title = playlist_title(&request.executable, &request.url);
+                let playlist_title = playlist_title(&request.executable, &request.url);
                 let _ = playlist_tx.send(PlaylistExpansionEvent {
                     url: request.url,
-                    playlist_title: title,
+                    playlist_title,
                     result,
                 });
             }
@@ -401,13 +411,23 @@ impl GuiApp {
                 while let Some(request) = download_request_rx.recv().await {
                     let event_tx = worker_event_tx.clone();
                     tokio::spawn(async move {
-                        let (download_tx, mut download_rx) = mpsc::unbounded_channel();
+                        let (download_tx, mut download_rx) = mpsc::channel(256);
                         let forward = tokio::spawn(async move {
                             while let Some(event) = download_rx.recv().await {
-                                let _ = event_tx.send(JobEvent {
+                                let is_progress = matches!(event, DownloadEvent::Progress { .. });
+                                let message = JobEvent {
                                     id: request.id,
                                     event,
-                                });
+                                };
+                                match event_tx.try_send(message) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(message)) => {
+                                        if !is_progress {
+                                            let _ = event_tx.send(message).await;
+                                        }
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
                             }
                         });
                         request
@@ -467,7 +487,31 @@ impl GuiApp {
             diagnostics_refresh_pending: false,
         };
         app.request_diagnostics_refresh(diagnostics_tx);
+        app.add_startup_urls(startup_urls);
         app
+    }
+
+    fn add_startup_urls(&mut self, urls: Vec<String>) {
+        if urls.is_empty() {
+            return;
+        }
+        let mut added = 0usize;
+        let pending_before = self.pending_playlists.len();
+        for url in urls {
+            match self.expand_or_enqueue(&url) {
+                Ok(count) => added += count,
+                Err(error) => {
+                    self.log_level(LogLevel::Warning, format!("Rejected startup URL: {error}"))
+                }
+            }
+        }
+        if added > 0 {
+            self.status = format!("Added {added} startup item(s) to the queue");
+        } else if self.pending_playlists.len() > pending_before {
+            self.status = "Inspecting startup playlist(s) in the background…".into();
+        } else {
+            self.status = "No valid startup URLs were added".into();
+        }
     }
 
     fn save_config(&mut self) {
@@ -816,6 +860,18 @@ impl GuiApp {
         self.apply_socket_timeout() && self.apply_retries() && self.apply_fragment_retries()
     }
 
+    fn apply_extractor_args(&mut self) -> bool {
+        let trimmed = self.extractor_args_text.trim();
+        if let Err(error) = prepared_extractor_args(trimmed) {
+            self.status = error;
+            return false;
+        }
+        self.config.extractor_args = trimmed.to_owned();
+        self.extractor_args_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
     fn start_queue(&mut self) {
         if self.active_downloads.is_empty()
             && !self
@@ -926,7 +982,7 @@ impl GuiApp {
 
         if self
             .download_request_tx
-            .send(DownloadRequest {
+            .try_send(DownloadRequest {
                 id,
                 downloader,
                 args,
@@ -935,7 +991,7 @@ impl GuiApp {
             .is_err()
         {
             self.active_downloads.remove(&id);
-            self.fail(index, "download worker is unavailable");
+            self.fail(index, "download worker is busy");
             return false;
         }
         true
@@ -1075,6 +1131,20 @@ impl GuiApp {
             self.pending_playlists.remove(&event.url);
             match event.result {
                 Ok(Some(entries)) if !entries.is_empty() => {
+                    if entries.len() > MAX_PLAYLIST_ENTRIES {
+                        let message = format!(
+                            "playlist expansion exceeded the {MAX_PLAYLIST_ENTRIES} entry limit"
+                        );
+                        self.log(format!(
+                            "Playlist expansion failed: {message} for {}",
+                            display_url(&event.url, self.config.show_sensitive_urls)
+                        ));
+                        self.status = redact_message(
+                            &message,
+                            self.config.show_sensitive_urls || cfg!(debug_assertions),
+                        );
+                        continue;
+                    }
                     let mut count = 0;
                     let folder = playlist_folder_name(&event.url, event.playlist_title.as_deref());
                     for entry in &entries {
@@ -1144,7 +1214,7 @@ impl GuiApp {
                 continue;
             };
             let texture = ctx.load_texture(
-                format!("queue-thumb-{index}"),
+                format!("queue-thumb-{}", self.queue[index].id),
                 egui::ColorImage::from_rgba_unmultiplied([image.width, image.height], &image.rgba),
                 egui::TextureOptions::LINEAR,
             );
@@ -1209,6 +1279,30 @@ impl GuiApp {
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        // Orchestrator: call small section helpers to keep this method concise
+        self.settings_section_url(ui);
+        ui.add_space(14.0);
+        self.settings_section_appearance(ui);
+        ui.add_space(14.0);
+        self.settings_section_search(ui);
+        ui.add_space(14.0);
+        self.settings_section_download_mode(ui);
+        ui.add_space(14.0);
+        self.settings_section_output_folder(ui);
+        ui.add_space(14.0);
+        self.settings_section_cookies(ui);
+        ui.add_space(14.0);
+        self.settings_section_impersonation(ui);
+        ui.add_space(14.0);
+        // Advanced and Environment reuse the existing methods
+        section_frame(ui, "Advanced yt-dlp options", |ui| {
+            self.advanced_settings_panel(ui)
+        });
+        ui.add_space(14.0);
+        section_frame(ui, "Environment", |ui| self.diagnostics_panel(ui));
+    }
+
+    fn settings_section_url(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "URL", |ui| {
             let mut paste_clicked = false;
             let response = ui
@@ -1248,8 +1342,9 @@ impl GuiApp {
                 self.add_input();
             }
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_appearance(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Appearance", |ui| {
             egui::ComboBox::from_id_salt("gui-theme")
                 .selected_text(self.current_theme().label())
@@ -1280,8 +1375,9 @@ impl GuiApp {
             });
             ui.small("Theme changes apply live. Lower opacity softens panel chrome.");
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_search(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Search in browser", |ui| {
             let response = text_edit_with_context_menu(
                 ui,
@@ -1317,8 +1413,9 @@ impl GuiApp {
                 self.open_search();
             }
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_download_mode(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Download mode", |ui| {
             let previous_mode = self.mode.clone();
             egui::ComboBox::from_id_salt("download-mode")
@@ -1367,8 +1464,9 @@ impl GuiApp {
                 self.save_config();
             }
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_output_folder(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Output folder", |ui| {
             let folder_response = text_edit_with_context_menu(
                 ui,
@@ -1401,8 +1499,9 @@ impl GuiApp {
                 self.apply_output_dir();
             }
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_cookies(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Cookies browser", |ui| {
             egui::ComboBox::from_id_salt("cookies-browser")
                 .selected_text(display_none(&self.config.cookies_browser))
@@ -1425,8 +1524,9 @@ impl GuiApp {
                     }
                 });
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_impersonation(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Impersonation", |ui| {
             egui::ComboBox::from_id_salt("impersonation")
                 .selected_text(display_none(&self.config.impersonation))
@@ -1462,14 +1562,6 @@ impl GuiApp {
                     }
                 });
         });
-
-        ui.add_space(14.0);
-        section_frame(ui, "Advanced yt-dlp options", |ui| {
-            self.advanced_settings_panel(ui)
-        });
-
-        ui.add_space(14.0);
-        section_frame(ui, "Environment", |ui| self.diagnostics_panel(ui));
     }
 
     fn browse_output_dir(&mut self) {
@@ -1600,8 +1692,7 @@ impl GuiApp {
             f32::INFINITY,
         );
         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-            self.config.extractor_args = self.extractor_args_text.trim().to_owned();
-            self.save_config();
+            self.apply_extractor_args();
         }
         ui.small("Passed as one safe --extractor-args value; leave blank for yt-dlp defaults.");
         if ui
@@ -2169,16 +2260,13 @@ impl OwnedDownloadOptions {
         )?;
 
         let browser = (config.cookies_browser != "none").then(|| config.cookies_browser.clone());
-        let mut impersonation =
-            (config.impersonation != "none").then(|| config.impersonation.clone());
-        if url.contains("spankbang.com") && impersonation.is_none() {
-            impersonation = browser
-                .as_deref()
-                .map(browser_impersonation)
-                .map(str::to_owned);
-        } else if url.contains("boyfriendtv.com") && impersonation.is_none() {
-            impersonation = Some("any".into());
-        }
+        let impersonation = effective_impersonation_target(
+            url,
+            (config.impersonation != "none").then_some(config.impersonation.as_str()),
+            browser.as_deref(),
+        )
+        .map(str::to_owned);
+        let extractor_args = prepared_extractor_args(&config.extractor_args)?.map(str::to_owned);
 
         Ok(Self {
             impersonation,
@@ -2191,8 +2279,7 @@ impl OwnedDownloadOptions {
             socket_timeout: tuning.socket_timeout,
             retries: tuning.retries,
             fragment_retries: tuning.fragment_retries,
-            extractor_args: (!config.extractor_args.trim().is_empty())
-                .then(|| config.extractor_args.trim().to_owned()),
+            extractor_args,
             playlist_subfolder: playlist_subfolder.map(str::to_owned),
             // GUI playlist expansion supplies an explicit sanitized folder per
             // queue item; do not add %(playlist_title)s to direct-video jobs.
@@ -2692,15 +2779,6 @@ fn display_none(value: &str) -> &str {
     }
 }
 
-fn browser_impersonation(browser: &str) -> &str {
-    match browser {
-        "firefox" => "firefox",
-        "edge" => "edge",
-        "chrome" | "chromium" | "brave" | "vivaldi" => "chrome",
-        _ => "any",
-    }
-}
-
 fn short_url(url: &str) -> &str {
     url.split_once("://")
         .map(|(_, remainder)| remainder)
@@ -2986,8 +3064,14 @@ fn persist_thumbnail_cache(
 }
 
 fn decode_thumbnail_from_path(path: &std::path::Path) -> Result<DecodedThumbnail, String> {
-    let image = ImageReader::open(path)
-        .map_err(|error| format!("thumbnail cache open failed: {error}"))?
+    let mut reader =
+        ImageReader::open(path).map_err(|error| format!("thumbnail cache open failed: {error}"))?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    reader.limits(limits);
+    let image = reader
         .decode()
         .map_err(|error| format!("thumbnail cache decode failed: {error}"))?
         .to_rgba8();
@@ -3138,7 +3222,8 @@ fn days_from_civil((year, month, day): (i32, u32, u32)) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_thumbnail_url;
+    use super::{validate_thumbnail_url, OwnedDownloadOptions};
+    use crusty_dlp::config::Config;
 
     #[test]
     fn rejects_thumbnail_urls_with_credentials() {
@@ -3162,5 +3247,52 @@ mod tests {
     #[test]
     fn accepts_public_thumbnail_targets() {
         assert!(validate_thumbnail_url("https://93.184.216.34/thumb.jpg").is_ok());
+    }
+
+    #[test]
+    fn playlist_folder_name_prefers_title_over_id() {
+        assert_eq!(
+            super::playlist_folder_name(
+                "https://pmvhaven.com/playlists/692b70e2d7984d93b13f83c2",
+                Some("Featured PMVHaven Picks"),
+            )
+            .as_deref(),
+            Some("Featured PMVHaven Picks")
+        );
+        assert_eq!(
+            super::playlist_folder_name(
+                "https://pmvhaven.com/playlists/692b70e2d7984d93b13f83c2",
+                None,
+            )
+            .as_deref(),
+            Some("692b70e2d7984d93b13f83c2")
+        );
+    }
+
+    #[test]
+    fn owned_download_options_reuse_shared_impersonation_rules() {
+        let config = Config {
+            cookies_browser: "firefox".into(),
+            ..Config::default()
+        };
+        let options = OwnedDownloadOptions::from_config(
+            &config,
+            "https://spankbang.com/7ubnq/video/example",
+            None,
+        )
+        .unwrap();
+        assert_eq!(options.impersonation.as_deref(), Some("firefox"));
+    }
+
+    #[test]
+    fn owned_download_options_reject_invalid_extractor_args() {
+        let config = Config {
+            extractor_args: "youtube:player_client=default\nspotify:foo=bar".into(),
+            ..Config::default()
+        };
+        let error = OwnedDownloadOptions::from_config(&config, "https://example.com/video", None)
+            .err()
+            .unwrap();
+        assert!(error.contains("Extractor arguments cannot contain NUL or newline characters"));
     }
 }

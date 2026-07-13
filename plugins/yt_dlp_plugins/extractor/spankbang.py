@@ -18,10 +18,14 @@ from yt_dlp.utils import (
 )
 
 
+SPANKBANG_DOMAIN = "spankbang.com"
+SPANKBANG_BASE_URL = f"https://{SPANKBANG_DOMAIN}"
+
+
 class SpankBangIE(InfoExtractor):
     IE_NAME = "spankbang:crusty"
     _VALID_URL = (
-        r"https?://(?:www\.)?spankbang\.com/"
+        rf"https?://(?:www\.)?{re.escape(SPANKBANG_DOMAIN)}/"
         r"(?:(?P<id>[a-z0-9]+)/(?:(?:video|embed)/)(?P<display_id>[^/?#]+)?"
         r"|[a-z0-9]+-(?P<playlist_id>[a-z0-9]+)/playlist/(?P<playlist_display_id>[^/?#]+))"
     )
@@ -31,7 +35,7 @@ class SpankBangIE(InfoExtractor):
         match = self._match_valid_url(url)
         video_id = match.group("id") or match.group("playlist_id")
         display_id = match.group("display_id") or match.group("playlist_display_id")
-        canonical_url = f"https://spankbang.com/{video_id}/video/{display_id or video_id}"
+        canonical_url = f"{SPANKBANG_BASE_URL}/{video_id}/video/{display_id or video_id}"
         webpage = self._download_webpage(canonical_url, video_id, impersonate=True)
         stream_data = self._search_json(
             r"\bvar\s+stream_data\s*=",
@@ -91,11 +95,11 @@ class SpankBangIE(InfoExtractor):
 
 class SpankBangPlaylistIE(InfoExtractor):
     IE_NAME = "spankbang:playlist"
-    _VALID_URL = r"https?://(?:www\.)?spankbang\.com/(?P<id>[\da-z]+)/playlist/(?P<display_id>[^/?#]+)"
+    _VALID_URL = rf"https?://(?:www\.)?{re.escape(SPANKBANG_DOMAIN)}/(?P<id>[\da-z]+)/playlist/(?P<display_id>[^/?#]+)"
 
     def _real_extract(self, url):
         playlist_id, display_id = self._match_valid_url(url).group("id", "display_id")
-        canonical_url = f"https://spankbang.com/{playlist_id}/playlist/{display_id}"
+        canonical_url = f"{SPANKBANG_BASE_URL}/{playlist_id}/playlist/{display_id}"
         webpage = self._download_webpage(canonical_url, playlist_id, impersonate=True)
 
         pattern = r'href=(["\'])(?P<path>/[\da-z]+-(?P<video_id>[\da-z]+)/playlist/[^"\']+)\1'

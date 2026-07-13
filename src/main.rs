@@ -19,6 +19,11 @@ use crusty_dlp::{
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::mpsc;
 
+struct JobEvent {
+    id: u64,
+    event: DownloadEvent,
+}
+
 #[derive(Debug, Parser)]
 #[command(version, about)]
 struct Cli {
@@ -96,16 +101,21 @@ async fn main() -> Result<()> {
         }
     });
 
-    let (download_tx, mut download_rx) = mpsc::unbounded_channel();
+    let (download_tx, mut download_rx) = mpsc::channel::<JobEvent>(256);
     loop {
         terminal.draw(|frame| ui::render(frame, &app))?;
         tokio::select! {
             Some(event) = key_rx.recv() => input::handle_event(&mut app, event),
-            Some(message) = download_rx.recv() => app.handle_download_event(message),
+            Some(message) = download_rx.recv() => app.handle_download_event(message.id, message.event),
         }
 
         if app.take_start_request() {
-            start_next(&mut app, download_tx.clone()).await;
+            while app.active_downloads() < app.max_active_downloads() {
+                let started = start_next(&mut app, download_tx.clone()).await;
+                if !started && !app.queue.iter().any(|item| item.state == crusty_dlp::app::DownloadState::Waiting) {
+                    break;
+                }
+            }
         }
         if app.should_quit {
             app.cancel();
@@ -115,17 +125,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn start_next(app: &mut App, tx: mpsc::UnboundedSender<DownloadEvent>) {
+async fn start_next(app: &mut App, tx: mpsc::Sender<JobEvent>) -> bool {
     let Some(item) = app.next_queued() else {
         app.message = "Queue is empty".into();
-        return;
+        return false;
     };
 
     let yt_dlp = match dependency_path("yt-dlp") {
         Some(path) => path,
         None => {
             app.fail_item(item, "yt-dlp was not found in PATH");
-            return;
+            return false;
         }
     };
     if (app.mode.needs_ffmpeg() || app.config.embed_metadata) && dependency_path("ffmpeg").is_none()
@@ -138,7 +148,7 @@ async fn start_next(app: &mut App, tx: mpsc::UnboundedSender<DownloadEvent>) {
                 "ffmpeg is required for this download type"
             },
         );
-        return;
+        return false;
     }
 
     let downloader = Downloader::new(yt_dlp, app.config.output_dir.clone());
@@ -147,29 +157,47 @@ async fn start_next(app: &mut App, tx: mpsc::UnboundedSender<DownloadEvent>) {
             item,
             "BoyfriendTV requires impersonation; install: sudo pacman -S python-curl_cffi",
         );
-        return;
+        return false;
     }
     let options = match app.download_options(&item.url) {
         Ok(options) => options,
         Err(error) => {
             app.fail_item(item, &error);
-            return;
+            return false;
         }
     };
     let args = match downloader.arguments(&item.url, &app.mode, options) {
         Ok(args) => args,
         Err(error) => {
             app.fail_item(item, &error);
-            return;
+            return false;
         }
     };
     if app.dry_run {
         app.finish_dry_run(item, downloader.display_command(&args));
-        return;
+        return true;
     }
 
-    let cancel = app.begin_download(item);
+    let (id, cancel) = app.begin_download(item);
     tokio::spawn(async move {
-        downloader.run(args, cancel, tx).await;
+        let (job_tx, mut job_rx) = mpsc::channel(256);
+        let forward = tokio::spawn(async move {
+            while let Some(event) = job_rx.recv().await {
+                let is_progress = matches!(event, DownloadEvent::Progress { .. });
+                let message = JobEvent { id, event };
+                match tx.try_send(message) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(message)) => {
+                        if !is_progress {
+                            let _ = tx.send(message).await;
+                        }
+                    }
+                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        });
+        downloader.run(args, cancel, job_tx).await;
+        let _ = forward.await;
     });
+    true
 }

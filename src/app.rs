@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, path::PathBuf};
+use std::{
+    collections::{HashMap, VecDeque},
+    path::PathBuf,
+};
 
 use tokio::sync::oneshot;
 
@@ -59,6 +62,7 @@ impl DownloadState {
 
 #[derive(Debug, Clone)]
 pub struct QueueItem {
+    pub id: u64,
     pub url: String,
     pub state: DownloadState,
 }
@@ -79,7 +83,7 @@ pub struct App {
     pub config_path: PathBuf,
     pub mode: DownloadMode,
     pub queue: VecDeque<QueueItem>,
-    pub current: Option<QueueItem>,
+    pub active: Vec<QueueItem>,
     pub input: String,
     pub search_query: String,
     pub panel: Panel,
@@ -95,8 +99,9 @@ pub struct App {
     pub impersonation_targets: Vec<String>,
     pub show_install_prompt: bool,
     pub aria2_available: bool,
+    next_queue_id: u64,
     start_requested: bool,
-    cancel_tx: Option<oneshot::Sender<()>>,
+    cancel_txs: HashMap<u64, oneshot::Sender<()>>,
 }
 
 impl App {
@@ -123,7 +128,7 @@ impl App {
             config_path,
             mode,
             queue: VecDeque::new(),
-            current: None,
+            active: Vec::new(),
             input: String::new(),
             search_query: String::new(),
             panel: Panel::Url,
@@ -139,8 +144,9 @@ impl App {
             impersonation_targets,
             show_install_prompt: false,
             aria2_available,
+            next_queue_id: 1,
             start_requested: false,
-            cancel_tx: None,
+            cancel_txs: HashMap::new(),
         }
     }
 
@@ -162,7 +168,10 @@ impl App {
             Ok(()) => {
                 let needs_spankbang_session =
                     is_spankbang_url(&url) && self.config.cookies_browser == "none";
+                let id = self.next_queue_id;
+                self.next_queue_id = self.next_queue_id.wrapping_add(1).max(1);
                 self.queue.push_back(QueueItem {
+                    id,
                     url,
                     state: DownloadState::Waiting,
                 });
@@ -416,10 +425,11 @@ impl App {
     }
 
     pub fn request_start(&mut self) {
-        if self.current.is_some() {
-            self.message = "A download is already running".into();
+        self.start_requested = true;
+        if self.active.is_empty() {
+            self.message = "Starting queue".into();
         } else {
-            self.start_requested = true;
+            self.message = format!("Queue active ({} running)", self.active.len());
         }
     }
 
@@ -437,15 +447,16 @@ impl App {
         item
     }
 
-    pub fn begin_download(&mut self, mut item: QueueItem) -> oneshot::Receiver<()> {
+    pub fn begin_download(&mut self, mut item: QueueItem) -> (u64, oneshot::Receiver<()>) {
         item.state = DownloadState::Downloading;
-        self.current = Some(item);
+        let id = item.id;
+        self.active.push(item);
         self.message = "Downloading".into();
         self.progress = None;
         self.progress_text.clear();
         let (tx, rx) = oneshot::channel();
-        self.cancel_tx = Some(tx);
-        rx
+        self.cancel_txs.insert(id, tx);
+        (id, rx)
     }
 
     pub fn fail_item(&mut self, mut item: QueueItem, message: &str) {
@@ -470,39 +481,48 @@ impl App {
     }
 
     pub fn cancel(&mut self) {
-        if let Some(tx) = self.cancel_tx.take() {
-            let _ = tx.send(());
-            self.message = "Cancelling…".into();
-        } else {
+        if self.cancel_txs.is_empty() {
             self.message = "No active download".into();
+            return;
+        }
+        for (_, tx) in self.cancel_txs.drain() {
+            let _ = tx.send(());
+        }
+        if self.active.len() == 1 {
+            self.message = "Cancelling active download…".into();
+        } else {
+            self.message = format!("Cancelling {} active downloads…", self.active.len());
         }
     }
 
-    pub fn handle_download_event(&mut self, event: DownloadEvent) {
+    pub fn handle_download_event(&mut self, id: u64, event: DownloadEvent) {
         match event {
             DownloadEvent::Progress { percent, text } => {
                 self.progress = percent;
                 self.progress_text = text;
             }
             DownloadEvent::Finished => {
-                self.complete_current(DownloadState::Finished, "Download finished")
+                self.complete_current(id, DownloadState::Finished, "Download finished")
             }
-            DownloadEvent::Failed(error) => self.complete_current(DownloadState::Failed, &error),
+            DownloadEvent::Failed(error) => {
+                self.complete_current(id, DownloadState::Failed, &error)
+            }
             DownloadEvent::Cancelled => {
-                self.complete_current(DownloadState::Cancelled, "Download cancelled")
+                self.complete_current(id, DownloadState::Cancelled, "Download cancelled")
             }
         }
     }
 
-    fn complete_current(&mut self, state: DownloadState, message: &str) {
-        if let Some(mut item) = self.current.take() {
+    fn complete_current(&mut self, id: u64, state: DownloadState, message: &str) {
+        if let Some(position) = self.active.iter().position(|item| item.id == id) {
+            let mut item = self.active.remove(position);
             item.state = state;
             self.queue.push_back(item);
         }
         self.clamp_queue_offset();
-        self.cancel_tx = None;
+        self.cancel_txs.remove(&id);
         self.set_message(message);
-        if state == DownloadState::Finished
+        if state != DownloadState::Cancelled
             && self
                 .queue
                 .iter()
@@ -510,6 +530,14 @@ impl App {
         {
             self.start_requested = true;
         }
+    }
+
+    pub fn active_downloads(&self) -> usize {
+        self.active.len()
+    }
+
+    pub fn max_active_downloads(&self) -> usize {
+        usize::from(self.config.max_active_downloads.clamp(1, 8))
     }
 
     pub fn scroll_queue(&mut self, delta: isize) {
@@ -522,7 +550,7 @@ impl App {
     }
 
     fn clamp_queue_offset(&mut self) {
-        let total = self.queue.len() + usize::from(self.current.is_some());
+        let total = self.queue.len() + self.active.len();
         self.queue_offset = self.queue_offset.min(total.saturating_sub(1));
     }
 }
@@ -597,10 +625,12 @@ mod tests {
             false,
         );
         app.queue.push_back(QueueItem {
+            id: 1,
             url: "https://example.com/old".into(),
             state: DownloadState::Finished,
         });
         app.queue.push_back(QueueItem {
+            id: 2,
             url: "https://example.com/new".into(),
             state: DownloadState::Waiting,
         });
@@ -665,5 +695,32 @@ mod tests {
         assert_eq!(options.socket_timeout, Some(60));
         assert_eq!(options.retries, Some(10));
         assert_eq!(options.fragment_retries, Some(10));
+    }
+
+    #[test]
+    fn cancelled_download_does_not_auto_restart_waiting_items() {
+        let mut app = App::new(
+            Config::default(),
+            "config.toml".into(),
+            false,
+            false,
+            Vec::new(),
+            false,
+        );
+        app.queue.push_back(QueueItem {
+            id: 1,
+            url: "https://example.com/finished".into(),
+            state: DownloadState::Waiting,
+        });
+        let (id, _cancel_rx) = app.begin_download(QueueItem {
+            id: 2,
+            url: "https://example.com/active".into(),
+            state: DownloadState::Waiting,
+        });
+
+        app.handle_download_event(id, DownloadEvent::Cancelled);
+
+        assert_eq!(app.queue.back().unwrap().state, DownloadState::Cancelled);
+        assert!(!app.take_start_request());
     }
 }

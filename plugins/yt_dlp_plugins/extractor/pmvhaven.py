@@ -7,9 +7,13 @@ from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import ExtractorError, orderedSet, url_or_none, urljoin
 
 
+PMVHAVEN_DOMAIN = "pmvhaven.com"
+PMVHAVEN_BASE_URL = f"https://{PMVHAVEN_DOMAIN}"
+
+
 class PMVHavenIE(InfoExtractor):
     IE_NAME = "pmvhaven"
-    _VALID_URL = r"https?://(?:www\.)?pmvhaven\.com/videos?/(?P<id>[^/?#]+)"
+    _VALID_URL = rf"https?://(?:www\.)?{re.escape(PMVHAVEN_DOMAIN)}/videos?/(?P<id>[^/?#]+)"
 
     def _real_extract(self, url):
         display_id = self._match_id(url)
@@ -98,7 +102,7 @@ def _page_tags(extractor, webpage, info):
 
 class PMVHavenPlaylistIE(InfoExtractor):
     IE_NAME = "pmvhaven:playlist"
-    _VALID_URL = r"https?://(?:www\.)?pmvhaven\.com/playlists/(?P<id>[^/?#]+)"
+    _VALID_URL = rf"https?://(?:www\.)?{re.escape(PMVHAVEN_DOMAIN)}/playlists/(?P<id>[^/?#]+)"
 
     def _real_extract(self, url):
         playlist_id = self._match_id(url)

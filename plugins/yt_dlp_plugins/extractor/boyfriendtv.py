@@ -1,20 +1,25 @@
 """Independent yt-dlp extractor for public BoyfriendTV video pages."""
 
+import re
 from urllib.parse import parse_qs, urlsplit
 
 from yt_dlp.extractor.common import InfoExtractor
 from yt_dlp.utils import clean_html, determine_ext, js_to_json, url_or_none
 
 
+BOYFRIENDTV_DOMAIN = "boyfriendtv.com"
+BOYFRIENDTV_BASE_URL = f"https://www.{BOYFRIENDTV_DOMAIN}"
+
+
 class BoyfriendTVIE(InfoExtractor):
     IE_NAME = "boyfriendtv"
-    _VALID_URL = r"https?://(?:www\.)?boyfriendtv\.com/(?:[a-z]{2}/)?videos/(?P<id>\d+)(?:/[^/?#]+)?"
+    _VALID_URL = rf"https?://(?:www\.)?{re.escape(BOYFRIENDTV_DOMAIN)}/(?:[a-z]{{2}}/)?videos/(?P<id>\d+)(?:/[^/?#]+)?"
 
     def _real_extract(self, url):
         video_id = self._match_id(url)
         parsed_url = urlsplit(url)
         slug = parsed_url.path.rstrip("/").rsplit("/", 1)[-1] or video_id
-        canonical_url = f"https://www.boyfriendtv.com/videos/{video_id}/{slug}/"
+        canonical_url = f"{BOYFRIENDTV_BASE_URL}/videos/{video_id}/{slug}/"
         webpage = self._download_webpage(canonical_url, video_id, impersonate=True)
         sources = self._search_json(
             r"\bsources\s*:",

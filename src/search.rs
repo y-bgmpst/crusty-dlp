@@ -1,5 +1,7 @@
 use anyhow::{anyhow, Result};
 
+use crate::urls;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchPlatform {
     YouTube,
@@ -142,34 +144,29 @@ impl SearchPlatform {
     }
 
     pub fn search_url(self, query: &str) -> String {
-        let encoded = urlencoding::encode(query);
         match self {
-            Self::YouTube => {
-                format!("https://www.youtube.com/results?search_query={encoded}")
-            }
-            Self::Vimeo => format!("https://vimeo.com/search?q={encoded}"),
-            Self::Dailymotion => format!("https://www.dailymotion.com/search/{encoded}/videos"),
-            Self::Twitch => format!("https://www.twitch.tv/search?term={encoded}"),
-            Self::TikTok => format!("https://www.tiktok.com/search?q={encoded}"),
-            Self::Instagram => {
-                format!("https://www.instagram.com/explore/search/keyword/?q={encoded}")
-            }
-            Self::XTwitter => format!("https://x.com/search?q={encoded}&src=typed_query&f=live"),
-            Self::SoundCloud => format!("https://soundcloud.com/search?q={encoded}"),
-            Self::SpankBang => format!("https://spankbang.com/s/{encoded}/"),
-            Self::PornHub => format!("https://www.pornhub.com/video/search?search={encoded}"),
-            Self::XHamster => format!("https://xhamster.com/search/{encoded}"),
-            Self::XVideos => format!("https://www.xvideos.com/?k={encoded}"),
-            Self::XNXX => format!("https://www.xnxx.com/search/{encoded}"),
-            Self::YouPorn => format!("https://www.youporn.com/search/?query={encoded}"),
-            Self::Eporner => format!("https://www.eporner.com/search/{encoded}/"),
-            Self::RedTube => format!("https://www.redtube.com/?search={encoded}"),
-            Self::Beeg => format!("https://beeg.com/search?query={encoded}"),
-            Self::SunPorno => format!("https://www.sunporno.com/search/{encoded}/"),
-            Self::DrTuber => format!("https://www.drtuber.com/search/videos/{encoded}"),
-            Self::TnaFlix => format!("https://www.tnaflix.com/search/{encoded}"),
-            Self::Txxx => format!("https://txxx.com/search/{encoded}"),
-            Self::ThisVid => format!("https://thisvid.com/search/?q={encoded}"),
+            Self::YouTube => urls::youtube_search_url(query),
+            Self::Vimeo => urls::vimeo_search_url(query),
+            Self::Dailymotion => urls::dailymotion_search_url(query),
+            Self::Twitch => urls::twitch_search_url(query),
+            Self::TikTok => urls::tiktok_search_url(query),
+            Self::Instagram => urls::instagram_search_url(query),
+            Self::XTwitter => urls::xtwitter_search_url(query),
+            Self::SoundCloud => urls::soundcloud_search_url(query),
+            Self::SpankBang => urls::spankbang_search_url(query),
+            Self::PornHub => urls::pornhub_search_url(query),
+            Self::XHamster => urls::xhamster_search_url(query),
+            Self::XVideos => urls::xvideos_search_url(query),
+            Self::XNXX => urls::xnxx_search_url(query),
+            Self::YouPorn => urls::youporn_search_url(query),
+            Self::Eporner => urls::eporner_search_url(query),
+            Self::RedTube => urls::redtube_search_url(query),
+            Self::Beeg => urls::beeg_search_url(query),
+            Self::SunPorno => urls::sunporno_search_url(query),
+            Self::DrTuber => urls::drtuber_search_url(query),
+            Self::TnaFlix => urls::tnaflix_search_url(query),
+            Self::Txxx => urls::txxx_search_url(query),
+            Self::ThisVid => urls::thisvid_search_url(query),
         }
     }
 }

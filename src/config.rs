@@ -7,6 +7,7 @@ use std::{
 use anyhow::{Context, Result};
 use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
+use tempfile::NamedTempFile;
 
 use crate::errors::AppError;
 
@@ -109,15 +110,22 @@ impl Config {
                 .with_context(|| format!("could not create {}", parent.display()))?;
         }
         let text = toml::to_string_pretty(self)?;
-        let temporary = path.with_extension("toml.tmp");
-        let mut file = fs::File::create(&temporary)
-            .with_context(|| format!("could not create {}", temporary.display()))?;
-        file.write_all(text.as_bytes())
-            .with_context(|| format!("could not write {}", temporary.display()))?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| AppError::Config("configuration path has no parent directory".into()))?;
+        let mut temporary = NamedTempFile::new_in(parent)
+            .with_context(|| format!("could not create temporary file in {}", parent.display()))?;
+        let temporary_path_for_messages = temporary.path().to_path_buf();
+        let file = temporary.as_file_mut();
+        file.write_all(text.as_bytes()).with_context(|| {
+            format!("could not write {}", temporary_path_for_messages.display())
+        })?;
         file.sync_all()
-            .with_context(|| format!("could not sync {}", temporary.display()))?;
-        drop(file);
-        replace_file(&temporary, path)
+            .with_context(|| format!("could not sync {}", temporary_path_for_messages.display()))?;
+        let (_file, temporary_path) = temporary
+            .keep()
+            .with_context(|| "could not keep temporary config file".to_owned())?;
+        replace_file(&temporary_path, path)
             .with_context(|| format!("could not replace {}", path.display()))
     }
 }
