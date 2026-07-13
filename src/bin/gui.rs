@@ -19,7 +19,8 @@ use crusty_dlp::{
     config::{normalize_output_dir, validate_output_dir, Config},
     downloader::{
         available_impersonation_targets, current_executable_path, dependency_path,
-        expand_playlist_urls, playlist_title, resolve_network_tuning, resolved_plugin_directory,
+        effective_impersonation_target, expand_playlist_urls, playlist_title,
+        prepared_extractor_args, resolve_network_tuning, resolved_plugin_directory,
         sanitize_filename_component, supports_playlist_expansion, validate_output_template,
         validate_rate_limit, validate_retry_count, validate_socket_timeout, DownloadEvent,
         DownloadOptions, Downloader, PlaylistEntry, MAX_PLAYLIST_ENTRIES,
@@ -859,6 +860,18 @@ impl GuiApp {
         self.apply_socket_timeout() && self.apply_retries() && self.apply_fragment_retries()
     }
 
+    fn apply_extractor_args(&mut self) -> bool {
+        let trimmed = self.extractor_args_text.trim();
+        if let Err(error) = prepared_extractor_args(trimmed) {
+            self.status = error;
+            return false;
+        }
+        self.config.extractor_args = trimmed.to_owned();
+        self.extractor_args_text = trimmed.to_owned();
+        self.save_config();
+        true
+    }
+
     fn start_queue(&mut self) {
         if self.active_downloads.is_empty()
             && !self
@@ -1266,6 +1279,30 @@ impl GuiApp {
     }
 
     fn settings_panel(&mut self, ui: &mut egui::Ui) {
+        // Orchestrator: call small section helpers to keep this method concise
+        self.settings_section_url(ui);
+        ui.add_space(14.0);
+        self.settings_section_appearance(ui);
+        ui.add_space(14.0);
+        self.settings_section_search(ui);
+        ui.add_space(14.0);
+        self.settings_section_download_mode(ui);
+        ui.add_space(14.0);
+        self.settings_section_output_folder(ui);
+        ui.add_space(14.0);
+        self.settings_section_cookies(ui);
+        ui.add_space(14.0);
+        self.settings_section_impersonation(ui);
+        ui.add_space(14.0);
+        // Advanced and Environment reuse the existing methods
+        section_frame(ui, "Advanced yt-dlp options", |ui| {
+            self.advanced_settings_panel(ui)
+        });
+        ui.add_space(14.0);
+        section_frame(ui, "Environment", |ui| self.diagnostics_panel(ui));
+    }
+
+    fn settings_section_url(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "URL", |ui| {
             let mut paste_clicked = false;
             let response = ui
@@ -1305,8 +1342,9 @@ impl GuiApp {
                 self.add_input();
             }
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_appearance(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Appearance", |ui| {
             egui::ComboBox::from_id_salt("gui-theme")
                 .selected_text(self.current_theme().label())
@@ -1337,8 +1375,9 @@ impl GuiApp {
             });
             ui.small("Theme changes apply live. Lower opacity softens panel chrome.");
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_search(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Search in browser", |ui| {
             let response = text_edit_with_context_menu(
                 ui,
@@ -1374,8 +1413,9 @@ impl GuiApp {
                 self.open_search();
             }
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_download_mode(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Download mode", |ui| {
             let previous_mode = self.mode.clone();
             egui::ComboBox::from_id_salt("download-mode")
@@ -1424,8 +1464,9 @@ impl GuiApp {
                 self.save_config();
             }
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_output_folder(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Output folder", |ui| {
             let folder_response = text_edit_with_context_menu(
                 ui,
@@ -1458,8 +1499,9 @@ impl GuiApp {
                 self.apply_output_dir();
             }
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_cookies(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Cookies browser", |ui| {
             egui::ComboBox::from_id_salt("cookies-browser")
                 .selected_text(display_none(&self.config.cookies_browser))
@@ -1482,8 +1524,9 @@ impl GuiApp {
                     }
                 });
         });
+    }
 
-        ui.add_space(14.0);
+    fn settings_section_impersonation(&mut self, ui: &mut egui::Ui) {
         section_frame(ui, "Impersonation", |ui| {
             egui::ComboBox::from_id_salt("impersonation")
                 .selected_text(display_none(&self.config.impersonation))
@@ -1519,14 +1562,6 @@ impl GuiApp {
                     }
                 });
         });
-
-        ui.add_space(14.0);
-        section_frame(ui, "Advanced yt-dlp options", |ui| {
-            self.advanced_settings_panel(ui)
-        });
-
-        ui.add_space(14.0);
-        section_frame(ui, "Environment", |ui| self.diagnostics_panel(ui));
     }
 
     fn browse_output_dir(&mut self) {
@@ -1657,8 +1692,7 @@ impl GuiApp {
             f32::INFINITY,
         );
         if response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter)) {
-            self.config.extractor_args = self.extractor_args_text.trim().to_owned();
-            self.save_config();
+            self.apply_extractor_args();
         }
         ui.small("Passed as one safe --extractor-args value; leave blank for yt-dlp defaults.");
         if ui
@@ -2226,16 +2260,13 @@ impl OwnedDownloadOptions {
         )?;
 
         let browser = (config.cookies_browser != "none").then(|| config.cookies_browser.clone());
-        let mut impersonation =
-            (config.impersonation != "none").then(|| config.impersonation.clone());
-        if url.contains("spankbang.com") && impersonation.is_none() {
-            impersonation = browser
-                .as_deref()
-                .map(browser_impersonation)
-                .map(str::to_owned);
-        } else if url.contains("boyfriendtv.com") && impersonation.is_none() {
-            impersonation = Some("any".into());
-        }
+        let impersonation = effective_impersonation_target(
+            url,
+            (config.impersonation != "none").then_some(config.impersonation.as_str()),
+            browser.as_deref(),
+        )
+        .map(str::to_owned);
+        let extractor_args = prepared_extractor_args(&config.extractor_args)?.map(str::to_owned);
 
         Ok(Self {
             impersonation,
@@ -2248,8 +2279,7 @@ impl OwnedDownloadOptions {
             socket_timeout: tuning.socket_timeout,
             retries: tuning.retries,
             fragment_retries: tuning.fragment_retries,
-            extractor_args: (!config.extractor_args.trim().is_empty())
-                .then(|| config.extractor_args.trim().to_owned()),
+            extractor_args,
             playlist_subfolder: playlist_subfolder.map(str::to_owned),
             // GUI playlist expansion supplies an explicit sanitized folder per
             // queue item; do not add %(playlist_title)s to direct-video jobs.
@@ -2749,15 +2779,6 @@ fn display_none(value: &str) -> &str {
     }
 }
 
-fn browser_impersonation(browser: &str) -> &str {
-    match browser {
-        "firefox" => "firefox",
-        "edge" => "edge",
-        "chrome" | "chromium" | "brave" | "vivaldi" => "chrome",
-        _ => "any",
-    }
-}
-
 fn short_url(url: &str) -> &str {
     url.split_once("://")
         .map(|(_, remainder)| remainder)
@@ -3201,7 +3222,8 @@ fn days_from_civil((year, month, day): (i32, u32, u32)) -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_thumbnail_url;
+    use super::{validate_thumbnail_url, OwnedDownloadOptions};
+    use crusty_dlp::config::Config;
 
     #[test]
     fn rejects_thumbnail_urls_with_credentials() {
@@ -3245,5 +3267,32 @@ mod tests {
             .as_deref(),
             Some("692b70e2d7984d93b13f83c2")
         );
+    }
+
+    #[test]
+    fn owned_download_options_reuse_shared_impersonation_rules() {
+        let config = Config {
+            cookies_browser: "firefox".into(),
+            ..Config::default()
+        };
+        let options = OwnedDownloadOptions::from_config(
+            &config,
+            "https://spankbang.com/7ubnq/video/example",
+            None,
+        )
+        .unwrap();
+        assert_eq!(options.impersonation.as_deref(), Some("firefox"));
+    }
+
+    #[test]
+    fn owned_download_options_reject_invalid_extractor_args() {
+        let config = Config {
+            extractor_args: "youtube:player_client=default\nspotify:foo=bar".into(),
+            ..Config::default()
+        };
+        let error = OwnedDownloadOptions::from_config(&config, "https://example.com/video", None)
+            .err()
+            .unwrap();
+        assert!(error.contains("Extractor arguments cannot contain NUL or newline characters"));
     }
 }
