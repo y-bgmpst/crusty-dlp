@@ -1022,17 +1022,19 @@ pub fn effective_impersonation_target<'a>(
     configured_impersonation: Option<&'a str>,
     cookies_browser: Option<&str>,
 ) -> Option<&'a str> {
-    configured_impersonation.or_else(|| {
-        if is_spankbang_url(url) {
-            Some(browser_impersonation_target(
-                cookies_browser.unwrap_or("none"),
-            ))
-        } else if requires_impersonation(url) {
-            Some("any")
-        } else {
-            None
-        }
-    })
+    configured_impersonation
+        .filter(|target| *target != "none")
+        .or_else(|| {
+            if is_spankbang_url(url) {
+                Some(browser_impersonation_target(
+                    cookies_browser.unwrap_or("none"),
+                ))
+            } else if requires_impersonation(url) {
+                Some("any")
+            } else {
+                None
+            }
+        })
 }
 
 pub fn is_boyfriendtv_url(value: &str) -> bool {
@@ -1280,6 +1282,14 @@ mod tests {
         assert_eq!(
             effective_impersonation_target("https://example.com/video", Some("chrome"), None),
             Some("chrome")
+        );
+        assert_eq!(
+            effective_impersonation_target(
+                "https://www.boyfriendtv.com/videos/123/example",
+                Some("none"),
+                None,
+            ),
+            Some("any")
         );
     }
 
