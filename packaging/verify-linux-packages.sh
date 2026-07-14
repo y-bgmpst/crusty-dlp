@@ -48,6 +48,8 @@ verify_tree() {
     require_file "$prefix/share/icons/hicolor/scalable/apps/crusty-dlp.svg"
     require_file "$prefix/share/icons/hicolor/48x48/apps/crusty-dlp.png"
     require_file "$prefix/share/licenses/crusty-dlp/LICENSE"
+    require_file "$prefix/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/boyfriendtv.py"
+    require_file "$prefix/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/ooxxx.py"
     require_file "$prefix/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/pmvhaven.py"
     require_file "$prefix/share/crusty-dlp/plugins/yt_dlp_plugins/extractor/spankbang.py"
 
